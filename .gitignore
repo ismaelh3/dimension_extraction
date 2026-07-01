@@ -1,0 +1,7 @@
+venv
+camera_calibration_step/__pycache__/
+camera_calibration_step/output/
+camera_calibration_step/calibration_images/
+instance_segmentation_step/__pycache__/
+instance_segmentation_step/frames/
+.DS_Store
