@@ -4,4 +4,10 @@ camera_calibration_step/output/
 camera_calibration_step/calibration_images/
 instance_segmentation_step/__pycache__/
 instance_segmentation_step/frames/
+instance_segmentation_step/output/
+depth_estimation_step/__pycache__/
+depth_estimation_step/output/
+measurement_extraction_step/__pycache__/
+measurement_extraction_step/output/
 .DS_Store
+DS_Store

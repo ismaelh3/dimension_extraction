@@ -7,8 +7,8 @@ from transformers import pipeline as hf_pipeline
 
 # ─── Configuration ────────────────────────────────────────────────────────────
 
-SEG_RESULTS  = 'output/segmentation/segmentation_results.json'
-OUTPUT_DIR   = 'output/depth'
+SEG_RESULTS  = '../instance_segmentation_step/output/segmentation_results.json'
+OUTPUT_DIR   = 'output'
 DEPTH_MODEL  = 'depth-anything/Depth-Anything-V2-Small-hf'  # small = runs on M1 comfortably
 
 A4_REAL_WIDTH_M = 0.210   # A4 sheet width in metres (210mm)
@@ -191,7 +191,7 @@ def main():
 
         all_depth_results.append({
             'frame':              frame_path,
-            'depth_map_path':     depth_path,
+            'depth_map_path':     os.path.abspath(depth_path),
             'scale_factor':       scale_factor,
             'estimated_distance_m': round(estimated_distance, 4),
             'camera_matrix':      seg['camera_matrix'],

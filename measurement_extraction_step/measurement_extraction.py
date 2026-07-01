@@ -6,8 +6,8 @@ from datetime import datetime
 
 # ─── Configuration ────────────────────────────────────────────────────────────
 
-DEPTH_RESULTS = 'output/depth/depth_results.json'
-OUTPUT_DIR    = 'output/measurements'
+DEPTH_RESULTS = '../depth_estimation_step/output/depth_results.json'
+OUTPUT_DIR    = 'output'
 SUBJECT_ID    = 'product_001'   # change this per product you measure
 
 # ─── Pixel → world coordinate conversion ──────────────────────────────────────
