@@ -83,7 +83,7 @@ Accuracy is won or lost at capture time. Follow this protocol strictly:
 - Camera on tripod or stable surface — **no handheld**
 - Camera **perpendicular** to the product — not angled
 - **Plain, high-contrast background**
-- **A4 sheet** (210mm × 297mm) placed next to or behind the product, visible in every frame — this is the scale anchor
+- **A4 sheet** (210mm × 297mm) standing **in the same plane as the product's front face** — right next to it, NOT behind it — visible in every frame. The product's camera distance is taken directly from the sheet, so any gap between their planes becomes a proportional error on every dimension (ground-truth tested: a ~7cm plane gap produced a ~10% / +0.9cm overestimate on both width and height)
 - Even, diffuse lighting — no harsh shadows
 - Capture **minimum 5 frames** per product — measurements are averaged across frames, with outliers rejected
 - For a full 3D profile, capture a **front set and a separate side set** — the current pipeline measures width/height from a front view only; depth (front-to-back) requires the side view (see Step 5)
@@ -116,8 +116,10 @@ Frames are undistorted using the Step 1 calibration data before either detector 
 1. A4's real width is known: 210mm.
 2. Its pixel width in the frame comes from Step 3's bounding box.
 3. Pinhole camera model: `pixel_width = (real_width_m × focal_length_px) / distance_m` → solve for `distance_m`.
-4. Sample the relative depth map inside the A4 box and take the median value.
-5. `scale_factor = real_distance_m / median_relative_depth` — multiplying any pixel's relative depth by this factor converts it to metres.
+4. Sample the raw model output inside the A4 box and take the median. The model outputs **disparity** (higher = closer), so distance is proportional to `1/value` — the raw `predicted_depth` tensor is used, unnormalised, because any shift breaks that inverse mapping.
+5. `k = real_distance_m × median_disparity` — every pixel's metric depth is then `depth_m = k / disparity`.
+
+**Trust limits (ground-truth tested):** the model's output is affine-invariant, meaning it has an unknown offset that a single reference object cannot solve for. The anchored map is reliable for depth *ordering* and relative structure, but its absolute distances can be badly biased (it placed a bottle at 0.45m that a tape measure put at 0.673m). Step 5 therefore takes the product's distance from the A4 pinhole geometry, not from this map.
 
 Frames where the A4 sheet or product wasn't detected in Step 3 are skipped (scale can't be anchored without the reference object). Metric depth maps and colourised visualisations are saved to `output/`, consumed by Step 5.
 
@@ -129,7 +131,7 @@ Frames where the A4 sheet or product wasn't detected in Step 3 are skipped (scal
 
 1. Loads the metric depth map and the product's segmentation mask for each frame.
 2. Takes the **tight bounding box of the mask** (`get_mask_tight_bbox`) rather than YOLO's raw box — this excludes padding/background YOLO's box might include.
-3. Measures **width** across the middle row and **height** down the middle column of that box (avoiding noisy depth at the box's outer edges), converting pixel pairs to 3D world distance via the pinhole model (`pixel_to_world`).
+3. Takes the product's camera distance **from the A4 sheet's pinhole-derived distance** (hence the coplanar requirement in Step 2), and projects the box's edge midpoints to 3D at that single shared depth via `pixel_to_world`. Two things are deliberately *not* used: per-edge-pixel depth-map values (the upscaled depth map smears across the silhouette boundary — an edge pixel reading the background's depth once turned a 9cm bottle into an "81cm" one), and the depth map's absolute distances in general (see Step 4's trust limits). The mask-interior median depth is still printed as a diagnostic — a large gap vs. the A4 distance signals a non-coplanar A4 or a confused depth model.
 4. Repeats across all captured frames, then applies `robust_average()`: discards any per-frame measurement more than 1 standard deviation from the mean, and reports the mean ± std of what remains.
 
 **Current limitation:** only width and height are measured (a single front-facing view can't recover depth/front-to-back thickness). The output JSON's `depth` field is `null` with a note — run a second, side-view capture set and merge the two JSONs for a full 3D profile.

@@ -35,30 +35,34 @@ def estimate_depth(frame_path, depth_pipe):
     """
     Run Depth Anything V2 on a single frame.
 
-    Returns a float32 numpy array (same height/width as the frame) where
-    each value is the model's relative depth estimate for that pixel.
-    Higher values mean further from the camera in this model's convention.
+    Returns a float32 numpy array of the model's RAW output. Two things
+    matter about this output and both were originally gotten wrong here:
 
-    Note: these values are unitless — we scale them to metres in the next step.
+      1. It is DISPARITY-like: HIGHER values mean CLOSER to the camera
+         (verified empirically on our frames: near table edge ≈ high,
+         far wall ≈ low). Distance is proportional to 1/value, so the
+         conversion to metres happens in compute_metric_depth(), not by
+         a simple multiply.
+      2. We read output['predicted_depth'] (the raw float tensor), NOT
+         output['depth'] — that one is a uint8 visualisation image,
+         quantised to 256 levels, which destroys measurement precision.
+
+    No per-frame min-max normalisation either: subtracting the frame
+    minimum shifts every value and breaks the 1/value relationship that
+    the metric conversion depends on. Scale anchoring is done per-frame
+    anyway, so normalisation bought nothing.
     """
     image     = Image.open(frame_path).convert('RGB')
     output    = depth_pipe(image)
-    depth_pil = output['depth']                             # PIL image
-    depth_arr = np.array(depth_pil, dtype=np.float32)      # convert to numpy
-
-    # Normalise to 0–1 range so the scale factor is consistent across frames
-    d_min, d_max = depth_arr.min(), depth_arr.max()
-    if d_max - d_min > 0:
-        depth_arr = (depth_arr - d_min) / (d_max - d_min)
-
-    return depth_arr
+    disparity = output['predicted_depth'].squeeze().cpu().numpy().astype(np.float32)
+    return disparity
 
 
 # ─── Scale anchoring using A4 sheet ───────────────────────────────────────────
 
-def compute_scale_factor(depth_map, a4_box, camera_matrix):
+def compute_metric_depth(disparity_map, a4_box, camera_matrix):
     """
-    Convert the relative depth map to metric (metres) using the A4 sheet as reference.
+    Convert the raw disparity map to metric depth in metres, anchored on the A4 sheet.
 
     How it works:
       - We know the A4 sheet's real width: 210mm.
@@ -68,16 +72,25 @@ def compute_scale_factor(depth_map, a4_box, camera_matrix):
         Rearranged:
             real_distance_m = (real_width_m * focal_length_px) / pixel_width
       - This gives us the real-world distance from the camera to the A4 sheet.
-      - We then sample the relative depth values inside the A4 bounding box and
-        compute their median. That median relative depth corresponds to the real distance.
-      - Scale factor = real_distance_m / median_relative_depth
-      - Multiply any pixel's relative depth by this factor to get its distance in metres.
+      - The model outputs disparity: value ≈ k / distance (higher = closer),
+        with k unknown. The A4 anchor pins it down:
+            k = real_distance_m * median_disparity(A4 region)
+      - Every pixel's metric depth is then:  depth_m = k / disparity
+        (NOT depth = disparity * scale — that linear form is only correct at
+        the anchor itself and increasingly wrong everywhere else.)
+
+    Caveat: the model's output is affine-invariant disparity (k/z + shift).
+    With a single reference object we can only solve for k, so we assume the
+    shift is ~0. Any residual systematic bias from that assumption is exactly
+    what Step 7 (accuracy validation vs. tape measure) exists to catch.
+
+    Returns (metric_depth_map, real_distance_m, k) or (None, None, None).
     """
     x1, y1, x2, y2 = a4_box
     a4_pixel_width  = x2 - x1
 
     if a4_pixel_width <= 0:
-        return None, None
+        return None, None, None
 
     # Focal length in pixels (from camera calibration)
     focal_length_px = camera_matrix[0, 0]
@@ -85,25 +98,29 @@ def compute_scale_factor(depth_map, a4_box, camera_matrix):
     # Estimated real-world distance to A4 sheet
     real_distance_m = (A4_REAL_WIDTH_M * focal_length_px) / a4_pixel_width
 
-    # Sample the relative depth map inside the A4 bounding box
-    # Clip coordinates to stay within the depth map bounds
-    h, w     = depth_map.shape
+    # Sample the disparity map inside the A4 bounding box
+    # Clip coordinates to stay within the map bounds
+    h, w     = disparity_map.shape
     y1c, y2c = max(0, y1), min(h, y2)
     x1c, x2c = max(0, x1), min(w, x2)
-    a4_region = depth_map[y1c:y2c, x1c:x2c]
+    a4_region = disparity_map[y1c:y2c, x1c:x2c]
 
     if a4_region.size == 0:
-        return None, None
+        return None, None, None
 
-    median_relative_depth = float(np.median(a4_region))
+    median_disparity = float(np.median(a4_region))
 
-    if median_relative_depth <= 0:
-        return None, None
+    if median_disparity <= 0:
+        return None, None, None
 
-    # Scale factor converts relative depth values → metres
-    scale_factor = real_distance_m / median_relative_depth
+    # k converts disparity → metres via depth = k / disparity
+    k = real_distance_m * median_disparity
 
-    return scale_factor, real_distance_m
+    # Clamp near-zero disparities (far background / sky) so the division
+    # doesn't produce inf — those pixels are never measured anyway.
+    metric_depth = k / np.maximum(disparity_map, 1e-6)
+
+    return metric_depth, real_distance_m, k
 
 
 # ─── Resize depth map to match frame ──────────────────────────────────────────
@@ -160,39 +177,41 @@ def main():
             print()
             continue
 
-        # Run depth estimation on this frame
+        # Run depth estimation on this frame (raw disparity — higher = closer)
         print("  Running depth estimation...")
-        depth_map = estimate_depth(frame_path, depth_pipe)
+        disparity_map = estimate_depth(frame_path, depth_pipe)
 
-        # Resize depth map to match frame dimensions so coordinates align
-        depth_map = resize_depth_to_frame(depth_map, frame_path)
+        # Resize disparity map to match frame dimensions so coordinates align
+        disparity_map = resize_depth_to_frame(disparity_map, frame_path)
 
-        # Compute scale factor using the A4 sheet bounding box
+        # Convert disparity → metric depth (metres), anchored on the A4 sheet
         camera_matrix = np.array(seg['camera_matrix'])
         a4_box        = seg['a4_sheet']['box_xyxy']
-        scale_factor, estimated_distance = compute_scale_factor(depth_map, a4_box, camera_matrix)
+        depth_metric, estimated_distance, k = compute_metric_depth(disparity_map, a4_box, camera_matrix)
 
-        if scale_factor is None:
-            print("  [!] Scale anchoring failed — A4 region had no valid depth values.")
+        if depth_metric is None or estimated_distance is None or k is None:
+            print("  [!] Scale anchoring failed — A4 region had no valid disparity values.")
             print()
             continue
 
         print(f"  [✓] Estimated distance to A4 sheet: {estimated_distance:.3f}m")
-        print(f"  [✓] Scale factor: {scale_factor:.4f} (relative depth → metres)")
+        print(f"  [✓] Anchor constant k: {k:.4f} (depth_m = k / disparity)")
 
-        # Save the depth map as a .npy file so measurement_extraction.py can load it directly
+        # Save the METRIC depth map (metres) — measurement_extraction.py loads it as-is
         depth_path = os.path.join(OUTPUT_DIR, f'{base_name}_depth.npy')
-        np.save(depth_path, depth_map)
+        np.save(depth_path, depth_metric)
 
-        # Save a visual version of the depth map for inspection (colourised)
-        depth_vis    = (depth_map * 255).astype(np.uint8)
+        # Save a visual version for inspection (colourised disparity: bright = close)
+        d_min, d_max = disparity_map.min(), disparity_map.max()
+        depth_vis    = ((disparity_map - d_min) / max(d_max - d_min, 1e-6) * 255).astype(np.uint8)
         depth_colour = cv2.applyColorMap(depth_vis, cv2.COLORMAP_INFERNO)
         cv2.imwrite(os.path.join(OUTPUT_DIR, f'{base_name}_depth_vis.jpg'), depth_colour)
 
         all_depth_results.append({
             'frame':              frame_path,
             'depth_map_path':     os.path.abspath(depth_path),
-            'scale_factor':       scale_factor,
+            'depth_map_units':    'metres',
+            'anchor_constant_k':  k,
             'estimated_distance_m': round(estimated_distance, 4),
             'camera_matrix':      seg['camera_matrix'],
             'product':            seg['product'],

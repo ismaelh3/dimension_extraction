@@ -33,28 +33,44 @@ def pixel_to_world(px, py, depth_m, camera_matrix):
     return np.array([X, Y, depth_m])
 
 
-def measure_3d_distance(p1_px, p2_px, depth_map_metric, camera_matrix):
+def measure_3d_distance(p1_px, p2_px, depth_m, camera_matrix):
     """
     Compute the real-world distance (in metres) between two pixel points,
-    using the metric depth map to get each point's depth.
+    with BOTH points placed at the same known depth.
 
-    Clamps pixel indices to valid array bounds to avoid out-of-range errors.
+    Why a shared depth instead of each pixel's own depth-map value: the two
+    endpoints sit exactly on the product's silhouette edge, and the depth map
+    (predicted at ~518px, upscaled to full frame) is blurred across that
+    boundary — an edge pixel can easily read the background's depth instead of
+    the product's. Trusting per-edge-pixel depth turned a ~0.7m object/background
+    depth gap into tens of cm of fake width. The product is treated as lying at
+    one depth (its mask-interior median), which is exact for the fronto-parallel
+    captures this protocol requires.
     """
-    h, w = depth_map_metric.shape
-
-    # Clamp coordinates to valid array indices
-    x1 = int(np.clip(p1_px[0], 0, w - 1))
-    y1 = int(np.clip(p1_px[1], 0, h - 1))
-    x2 = int(np.clip(p2_px[0], 0, w - 1))
-    y2 = int(np.clip(p2_px[1], 0, h - 1))
-
-    d1 = float(depth_map_metric[y1, x1])
-    d2 = float(depth_map_metric[y2, x2])
-
-    p1_world = pixel_to_world(x1, y1, d1, camera_matrix)
-    p2_world = pixel_to_world(x2, y2, d2, camera_matrix)
+    p1_world = pixel_to_world(p1_px[0], p1_px[1], depth_m, camera_matrix)
+    p2_world = pixel_to_world(p2_px[0], p2_px[1], depth_m, camera_matrix)
 
     return float(np.linalg.norm(p1_world - p2_world))
+
+
+def get_product_median_depth(mask, depth_map_metric):
+    """
+    Median metric depth over the product mask INTERIOR.
+
+    The mask is eroded first so no sampled pixel sits near the silhouette
+    boundary, where the upscaled depth map bleeds between product and
+    background. Median (not mean) so any residual bleed pixels can't drag
+    the estimate. Falls back to the full mask if erosion eats everything
+    (very thin objects).
+    """
+    kernel_size = max(15, min(mask.shape) // 100)
+    kernel = np.ones((kernel_size, kernel_size), np.uint8)
+    eroded = cv2.erode(mask, kernel)
+    if cv2.countNonZero(eroded) == 0:
+        eroded = mask
+
+    values = depth_map_metric[eroded > 0]
+    return float(np.median(values))
 
 
 # ─── Extract product bounding box from mask ────────────────────────────────────
@@ -89,19 +105,20 @@ def measure_frame(depth_result):
     Extract product width and height from one frame.
 
     Approach:
-      1. Load the metric depth map (relative depth × scale factor).
+      1. Load the metric depth map (already in metres — Step 5 anchors and
+         converts it via depth_m = k / disparity).
       2. Get the tight bounding box of the product mask.
-      3. Identify the four corner pixels of that bounding box.
-      4. Convert corners to 3D world points using the depth at each pixel.
+      3. Take the product's distance from the A4 sheet's pinhole-derived
+         distance (requires the A4 coplanar with the product's front face —
+         see the comment at the assignment below for why not the depth map).
+      4. Convert the box's edge midpoints to 3D world points at that shared depth.
       5. Compute real-world width (left edge → right edge) and
          height (top edge → bottom edge).
 
     Returns a dict of measurements in metres, or None if anything is missing.
     """
-    # Load depth map and convert from relative to metric using the scale factor
-    depth_map_relative = np.load(depth_result['depth_map_path'])
-    scale_factor       = depth_result['scale_factor']
-    depth_map_metric   = depth_map_relative * scale_factor   # now in metres
+    # Load the metric depth map — Step 5 already converted it to metres
+    depth_map_metric = np.load(depth_result['depth_map_path'])
 
     camera_matrix = np.array(depth_result['camera_matrix'])
 
@@ -118,9 +135,25 @@ def measure_frame(depth_result):
 
     x1, y1, x2, y2 = bbox
 
-    # Define corner pixels of the bounding box
-    # We measure width along the middle row and height along the middle column
-    # to avoid edge pixels that might have noisy depth values
+    # Product distance comes from the A4 sheet's pinhole-derived distance, NOT
+    # from the monocular depth map. Ground-truth testing showed the depth map's
+    # absolute distances can't be trusted even after anchoring (it put a bottle
+    # at 0.45m that a tape measure put at 0.673m — a 33% error that scaled both
+    # dimensions down proportionally). The model's output is affine-invariant:
+    # reliable for depth ORDERING, unreliable for absolute distance, because a
+    # single reference can't solve for its unknown offset. The A4 distance is
+    # exact pinhole geometry instead — PROTOCOL REQUIREMENT: the A4 sheet must
+    # stand in the same plane as the product's front face (next to it, not
+    # behind it), otherwise this distance is the wrong plane's distance.
+    product_depth_m = depth_result['estimated_distance_m']
+
+    # Depth-map interior median, printed as a diagnostic only — a large gap
+    # between this and the A4 distance means either the A4 isn't coplanar with
+    # the product or the depth model misjudged the scene.
+    mask = cv2.imread(mask_path, cv2.IMREAD_GRAYSCALE)
+    depth_map_median_m = get_product_median_depth(mask, depth_map_metric)
+
+    # Measure width along the middle row and height along the middle column
     mid_y = (y1 + y2) // 2
     mid_x = (x1 + x2) // 2
 
@@ -130,14 +163,12 @@ def measure_frame(depth_result):
     bottom_px= (mid_x, y2)
 
     # Measure real-world width (horizontal span of the product)
-    width_m  = measure_3d_distance(left_px,   right_px,  depth_map_metric, camera_matrix)
+    width_m  = measure_3d_distance(left_px,   right_px,  product_depth_m, camera_matrix)
 
     # Measure real-world height (vertical span of the product)
-    height_m = measure_3d_distance(top_px,    bottom_px, depth_map_metric, camera_matrix)
+    height_m = measure_3d_distance(top_px,    bottom_px, product_depth_m, camera_matrix)
 
-    # Estimated depth of the product itself — sampled at mask centre
-    product_depth_m = float(depth_map_metric[mid_y, mid_x])
-
+    print(f"  Product depth: {product_depth_m:.3f} m (from A4; depth-map median said {depth_map_median_m:.3f} m)")
     print(f"  Width  : {width_m  * 100:.2f} cm")
     print(f"  Height : {height_m * 100:.2f} cm")
 
@@ -247,7 +278,7 @@ def main():
         },
         "reference_object": "A4_sheet_210x297mm",
         "model_versions": {
-            "segmentation":     "yolov8n-seg",
+            "segmentation":     "yolo26n-seg",
             "depth_estimation": "Depth-Anything-V2-Small",
         },
         "notes": (
