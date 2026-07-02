@@ -176,6 +176,12 @@ def measure_frame(depth_result):
         'width_m':        width_m,
         'height_m':       height_m,
         'product_depth_m': product_depth_m,   # camera-to-product distance, not object depth
+        # Frame resolution and physical size of one pixel at the product's
+        # plane — logged so downstream consumers can judge the measurement's
+        # resolution floor (models infer at ~640px/518px and upscale, so mask
+        # edge uncertainty is several full-res pixels, not one)
+        'resolution_wh':  [mask.shape[1], mask.shape[0]],
+        'mm_per_pixel':   product_depth_m / camera_matrix[0, 0] * 1000,
     }
 
 
@@ -229,6 +235,7 @@ def main():
     # Collect measurements from every valid frame
     width_measurements  = []
     height_measurements = []
+    capture_metadata    = None
 
     for i, dr in enumerate(depth_results):
         frame_name = os.path.basename(dr['frame'])
@@ -241,6 +248,12 @@ def main():
 
         width_measurements.append(measurements['width_m'])
         height_measurements.append(measurements['height_m'])
+        if capture_metadata is None:
+            capture_metadata = {
+                'image_resolution_wh': measurements['resolution_wh'],
+                'mm_per_pixel_at_product': round(measurements['mm_per_pixel'], 4),
+                'product_distance_m': round(measurements['product_depth_m'], 4),
+            }
         print()
 
     if not width_measurements:
@@ -277,6 +290,7 @@ def main():
             "height": height_err_cm,
         },
         "reference_object": "A4_sheet_210x297mm",
+        "capture_metadata": capture_metadata,
         "model_versions": {
             "segmentation":     "yolo26n-seg",
             "depth_estimation": "Depth-Anything-V2-Small",

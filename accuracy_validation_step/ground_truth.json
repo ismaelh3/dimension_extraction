@@ -1,8 +1,7 @@
 {
-  "_README": "Tape-measure 3-5 real products by hand and add their true dimensions in cm below, keyed by the exact subject_id used in measurement_extraction_step/measurement_extraction.py (the SUBJECT_ID constant). Use null for any dimension not physically measured (e.g. depth, which needs a side-view capture). Delete the _README and _example_do_not_use keys once real entries are added below -- any key starting with an underscore is ignored by accuracy_validation.py.",
-  "_example_do_not_use": {
-    "width": 12.5,
-    "height": 30.0,
+  "product_001": {
+    "width": 9.19,
+    "height": 25.73,
     "depth": null
   }
 }

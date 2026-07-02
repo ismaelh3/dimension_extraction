@@ -20,6 +20,7 @@ MIN_VALIDATION_SUBJECTS = 3     # brief recommends validating against 3-5 known 
 # is correct, it just means the error is systematic rather than random.
 PRECISION_ACCURACY_GAP_CM = 1.0
 
+# add real dimensions (in cm) into ground_truth.json for each product you want to validate against
 DIMENSIONS = ['width', 'height', 'depth']
 
 # ─── Load data ─────────────────────────────────────────────────────────────────
