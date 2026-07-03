@@ -7,10 +7,11 @@ from ultralytics import YOLO
 
 # -------------------------------------- Configuration --------------------------------------
 
-FRAMES_DIR  = 'frames'                  # folder containing your captured product frames
-OUTPUT_DIR  = 'output'                   # all results written here (local to this step)
-CALIB_FILE  = '../camera_calibration_step/output/calibration_data.pkl'
-YOLO_MODEL  = 'yolo26n-seg.pt'         # YOLOv8 nano segmentation model
+SCRIPT_DIR  = os.path.dirname(os.path.abspath(__file__))  # folder this script lives in, so paths work from any cwd
+FRAMES_DIR  = os.path.join(SCRIPT_DIR, 'frames')          # folder containing your captured product frames
+OUTPUT_DIR  = os.path.join(SCRIPT_DIR, 'output')          # all results written here (local to this step)
+CALIB_FILE  = os.path.join(SCRIPT_DIR, '..', 'camera_calibration_step', 'output', 'calibration_data.pkl')
+YOLO_MODEL  = os.path.join(SCRIPT_DIR, 'yolo26n-seg.pt')  # YOLOv8 nano segmentation model
 
 # Set this to the YOLO class name of your product if you know it (e.g. 'bottle', 'chair', 'laptop').
 # Leave as None to auto-select the most confident non-person detection in each frame.

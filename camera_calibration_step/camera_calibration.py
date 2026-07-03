@@ -8,8 +8,9 @@ import pickle
 # You can modify these variables as needed
 CHESSBOARD_SIZE = (8, 6)  # Number of inner corners per chessboard row and column
 SQUARE_SIZE = 2.5          # Size of a square in centimeters (25mm from PDF)
-CALIBRATION_IMAGES_PATH = 'calibration_images/*.jpeg'  # Path to calibration images
-OUTPUT_DIRECTORY = 'output'  # Directory to save calibration results
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))  # Folder this script lives in, so paths work from any cwd
+CALIBRATION_IMAGES_PATH = os.path.join(SCRIPT_DIR, 'calibration_images', '*.jpeg')  # Path to calibration images
+OUTPUT_DIRECTORY = os.path.join(SCRIPT_DIR, 'output')  # Directory to save calibration results
 SAVE_UNDISTORTED = True   # Whether to save undistorted images
 
 def calibrate_camera():

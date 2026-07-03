@@ -7,8 +7,9 @@ from transformers import pipeline as hf_pipeline
 
 # ─── Configuration ────────────────────────────────────────────────────────────
 
-SEG_RESULTS  = '../instance_segmentation_step/output/segmentation_results.json'
-OUTPUT_DIR   = 'output'
+SCRIPT_DIR   = os.path.dirname(os.path.abspath(__file__))  # folder this script lives in, so paths work from any cwd
+SEG_RESULTS  = os.path.join(SCRIPT_DIR, '..', 'instance_segmentation_step', 'output', 'segmentation_results.json')
+OUTPUT_DIR   = os.path.join(SCRIPT_DIR, 'output')
 DEPTH_MODEL  = 'depth-anything/Depth-Anything-V2-Small-hf'  # small = runs on M1 comfortably
 
 A4_REAL_WIDTH_M = 0.210   # A4 sheet width in metres (210mm)
