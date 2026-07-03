@@ -3,7 +3,7 @@ import numpy as np
 import os
 import json
 import pickle
-from ultralytics import YOLO
+from ultralytics import YOLOE
 
 # -------------------------------------- Configuration --------------------------------------
 
@@ -11,11 +11,16 @@ SCRIPT_DIR  = os.path.dirname(os.path.abspath(__file__))  # folder this script l
 FRAMES_DIR  = os.path.join(SCRIPT_DIR, 'frames')          # folder containing your captured product frames
 OUTPUT_DIR  = os.path.join(SCRIPT_DIR, 'output')          # all results written here (local to this step)
 CALIB_FILE  = os.path.join(SCRIPT_DIR, '..', 'camera_calibration_step', 'output', 'calibration_data.pkl')
-YOLO_MODEL  = os.path.join(SCRIPT_DIR, 'yolo26n-seg.pt')  # YOLOv8 nano segmentation model
+YOLO_MODEL  = os.path.join(SCRIPT_DIR, 'yoloe-26s-seg.pt')  # YOLOE-26 small — open-vocabulary segmentation
 
-# Set this to the YOLO class name of your product if you know it (e.g. 'bottle', 'chair', 'laptop').
-# Leave as None to auto-select the most confident non-person detection in each frame.
-PRODUCT_CLASS = None
+# What to segment. YOLOE is open-vocabulary: describe the product in a word or two
+# ('shoe', 'water bottle', 'cardboard box') — change this per product you measure.
+# The COCO-class limitation of plain YOLO does not apply here.
+PRODUCT_PROMPT = 'shoe'
+
+# Inference resolution. The measurements are taken from the mask's edges, so run the
+# network at a higher resolution than the default 640 for cleaner boundaries.
+IMG_SIZE = 1280
 
 # A4 sheet is 210mm wide × 297mm tall (portrait).
 # These constants control how the detector decides what counts as an A4 sheet.
@@ -64,20 +69,24 @@ def undistort_frame(frame, camera_matrix, dist_coeffs):
     return undistorted, new_matrix
 
 
-# -------------------------------------- Product segmentation (YOLOv8) --------------------------------------
+# -------------------------------------- Product segmentation (YOLOE) --------------------------------------
 
 def detect_product(frame, model):
     """
-    Run YOLOv8 on the frame and return the mask + bounding box for the target product.
+    Run YOLOE on the frame and return the mask + bounding box for the target product.
 
-    If PRODUCT_CLASS is set, filters to that specific class name.
-    If PRODUCT_CLASS is None, picks the highest-confidence detection that is NOT a person —
-    this handles unknown or generic product types without needing a labelled class.
+    The model is text-prompted with PRODUCT_PROMPT (set up in main), so everything it
+    returns is already "the product" — no class filtering needed here. If several
+    instances match the prompt, the most confident one is kept.
+
+    retina_masks=True makes ultralytics build the mask at the original frame
+    resolution instead of the network's internal size — sharper edges, which matter
+    because the measurement step reads dimensions off this mask's boundary.
 
     Returns the binary mask (white = product area), bounding box [x1,y1,x2,y2],
     detected class name, and confidence score.
     """
-    results = model(frame, verbose=False)
+    results = model(frame, imgsz=IMG_SIZE, retina_masks=True, verbose=False)
 
     best_conf      = 0.0
     best_mask      = None
@@ -89,29 +98,18 @@ def detect_product(frame, model):
             continue
 
         for i, cls_id in enumerate(result.boxes.cls):
-            class_name = result.names[int(cls_id)]
-
-            if PRODUCT_CLASS is not None:
-                # Strict mode — only accept the specified product class
-                if class_name != PRODUCT_CLASS:
-                    continue
-            else:
-                # Auto mode — skip people, take anything else
-                if class_name == 'person':
-                    continue
-
             conf = float(result.boxes.conf[i])
             if conf <= best_conf:
                 continue  # keep only the most confident detection
 
             best_conf  = conf
-            best_class = class_name
+            best_class = result.names[int(cls_id)]
 
-            # YOLO returns masks scaled to its internal resolution — resize to frame size
             raw_mask = result.masks.data[i].cpu().numpy()
             h, w = frame.shape[:2]
-            resized_mask = cv2.resize(raw_mask, (w, h), interpolation=cv2.INTER_NEAREST)
-            best_mask = (resized_mask > 0.5).astype(np.uint8) * 255
+            if raw_mask.shape != (h, w):
+                raw_mask = cv2.resize(raw_mask, (w, h), interpolation=cv2.INTER_NEAREST)
+            best_mask = (raw_mask > 0.5).astype(np.uint8) * 255
 
             box = result.boxes.xyxy[i].cpu().numpy().astype(int)
             best_box = box.tolist()
@@ -342,10 +340,7 @@ def main():
         return
 
     print(f"Found {len(frame_paths)} frame(s) to process.")
-    if PRODUCT_CLASS:
-        print(f"Product class filter: '{PRODUCT_CLASS}'")
-    else:
-        print("Product class filter: auto (most confident non-person detection)")
+    print(f"Product prompt: '{PRODUCT_PROMPT}'")
     print()
 
     # Load calibration data produced by camera_calibration.py
@@ -353,9 +348,12 @@ def main():
     camera_matrix, dist_coeffs = load_calibration(CALIB_FILE)
     print("Calibration loaded.\n")
 
-    # Load YOLOv8 segmentation model (downloads automatically on first run)
-    print(f"Loading YOLO model '{YOLO_MODEL}'...")
-    model = YOLO(YOLO_MODEL)
+    # Load the YOLOE segmentation model (downloads automatically on first run) and
+    # prompt it with the product description — after set_classes() the model only
+    # looks for that one thing, whatever it is.
+    print(f"Loading YOLOE model '{YOLO_MODEL}'...")
+    model = YOLOE(YOLO_MODEL)
+    model.set_classes([PRODUCT_PROMPT], model.get_text_pe([PRODUCT_PROMPT]))
     print("Model ready.\n")
 
     os.makedirs(OUTPUT_DIR, exist_ok=True)
@@ -386,8 +384,8 @@ def main():
 
     if product_ok < total:
         print("\n[!] Product missed in some frames.")
-        print("    Set PRODUCT_CLASS at the top of this file to the exact YOLO class name")
-        print("    (e.g. 'bottle', 'chair') to help the detector focus.")
+        print("    Try rewording PRODUCT_PROMPT at the top of this file (e.g. 'sneaker'")
+        print("    instead of 'shoe'), or put more light on the product.")
 
     if a4_ok < total:
         print("\n[!] A4 sheet missed in some frames.")
