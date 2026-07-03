@@ -12,3 +12,7 @@ measurement_extraction_step/output/
 .DS_Store
 accuracy_validation_step/__pycache__/
 accuracy_validation_step/output/
+
+# model weights (auto-downloaded)
+*.pt
+*.ts

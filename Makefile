@@ -1,5 +1,5 @@
 
-.PHONY: help setup camera-calibration instance-segmentation depth-estimation measurement-extraction full-pipeline clean-images clean-frames clean-some-outputs clean-outputs clean-all
+.PHONY: help setup camera-calibration instance-segmentation depth-estimation measurement-extraction accuracy-validation full-pipeline clean-images clean-frames clean-some-outputs clean-outputs clean-all
 
 VENV = venv
 PYTHON = $(VENV)/bin/python
@@ -34,7 +34,14 @@ measurement-extraction:
 	@echo "running measurement step..."
 	@$(PYTHON) measurement_extraction_step/measurement_extraction.py
 
-full-pipeline: camera-calibration instance-segmentation depth-estimation measurement-extraction
+accuracy-validation:
+	@echo "running accuracy validation step..."
+	@$(PYTHON) accuracy_validation_step/accuracy_validation.py
+
+most-pipeline: instance-segmentation depth-estimation measurement-extraction
+	@echo "running the majority of the pipeline"	
+
+full-pipeline: camera-calibration instance-segmentation depth-estimation measurement-extraction accuracy-validation
 	@echo "running full pipeline complete"
 
 clean-images:
@@ -58,8 +65,7 @@ clean-outputs:
 	@rm -rf depth_estimation_step/output/*
 	@rm -rf measurement_extraction_step/output/*
 
-clean-mostly: clean-frames clean-outputs
-	@echo "cleaning mostly complete"
+light-clean: clean-frames clean-some-outputs
 
-clean-all: clean-images clean-frames clean-outputs
+deep-clean: clean-images light-clean
 	@echo "cleaning complete"

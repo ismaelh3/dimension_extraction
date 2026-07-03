@@ -6,9 +6,10 @@ from datetime import datetime
 
 # ─── Configuration ────────────────────────────────────────────────────────────
 
-MEASUREMENTS_DIR  = '../measurement_extraction_step/output'
-GROUND_TRUTH_FILE = 'ground_truth.json'
-OUTPUT_DIR        = 'output'
+SCRIPT_DIR        = os.path.dirname(os.path.abspath(__file__))  # folder this script lives in, so paths work from any cwd
+MEASUREMENTS_DIR  = os.path.join(SCRIPT_DIR, '..', 'measurement_extraction_step', 'output')
+GROUND_TRUTH_FILE = os.path.join(SCRIPT_DIR, 'ground_truth.json')
+OUTPUT_DIR        = os.path.join(SCRIPT_DIR, 'output')
 HISTORY_FILE      = os.path.join(OUTPUT_DIR, 'accuracy_history.jsonl')
 
 TOLERANCE_CM            = 2.0   # target error tolerance from the project brief

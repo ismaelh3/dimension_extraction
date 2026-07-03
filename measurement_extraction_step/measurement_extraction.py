@@ -9,7 +9,7 @@ from datetime import datetime
 SCRIPT_DIR    = os.path.dirname(os.path.abspath(__file__))  # folder this script lives in, so paths work from any cwd
 DEPTH_RESULTS = os.path.join(SCRIPT_DIR, '..', 'depth_estimation_step', 'output', 'depth_results.json')
 OUTPUT_DIR    = os.path.join(SCRIPT_DIR, 'output')
-SUBJECT_ID    = 'product_001'   # change this per product you measure
+SUBJECT_ID    = 'product_002'   # change this per product you measure
 
 # ─── Pixel → world coordinate conversion ──────────────────────────────────────
 
