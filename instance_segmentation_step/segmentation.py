@@ -16,7 +16,7 @@ YOLO_MODEL  = os.path.join(SCRIPT_DIR, 'yoloe-26s-seg.pt')  # YOLOE-26 small —
 # What to segment. YOLOE is open-vocabulary: describe the product in a word or two
 # ('shoe', 'water bottle', 'cardboard box') — change this per product you measure.
 # The COCO-class limitation of plain YOLO does not apply here.
-PRODUCT_PROMPT = 'sports ball'
+PRODUCT_PROMPT = 'INSERT_PROMPT'
 
 # Inference resolution. The measurements are taken from the mask's edges, so run the
 # network at a higher resolution than the default 640 for cleaner boundaries.

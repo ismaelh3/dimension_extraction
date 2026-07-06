@@ -12,6 +12,7 @@ measurement_extraction_step/output/
 .DS_Store
 accuracy_validation_step/__pycache__/
 accuracy_validation_step/output/
+accuracy_validation_step/ground_truth.json
 
 # model weights (auto-downloaded)
 *.pt

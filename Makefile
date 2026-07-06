@@ -10,7 +10,7 @@ help:
 	@echo "  make setup					* Create a local virtual environment and install dependencies"
 	@echo "  make [specify_step]				* Run the specified step"
 	@echo "  make full-pipeline				* Run the entire pipeline"
-	@echo "  VIEW=side make measurement-extraction	* Measure a side-view capture set (default: front)"
+	@echo "  VIEW=side make measurement-extraction		* Measure a side-view capture set (default: front)"
 	@echo "  make merge-views				* Combine front+side views into the final measurements JSON"
 	@echo "  make clean-all    				* Remove build artifacts and clear outputs"
 
