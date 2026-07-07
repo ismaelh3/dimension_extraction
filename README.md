@@ -23,8 +23,9 @@ iPhone photos (product + A4 sheet in frame)
 ① Camera Calibration ─────────── one-time: checkerboard photos → focal length,
         │                        distortion coefficients (OpenCV)
         ▼
-② Instance Segmentation ──────── YOLO26 masks the product; OpenCV contour
-        │                        analysis finds the A4 sheet's corners
+② Instance Segmentation ──────── Grounded-SAM: Grounding DINO finds the product
+        │                        from a text prompt, SAM 2 masks it; OpenCV
+        │                        contour analysis finds the A4 sheet's corners
         ▼
 ③ Depth Estimation ───────────── Depth Anything V2 gives relative depth;
         │                        the A4 sheet anchors it to metres
@@ -68,7 +69,7 @@ source venv/bin/activate
 pip install -r requirements.txt
 ```
 
-Model weights (YOLO26-nano ~6 MB, Depth Anything V2 Small ~100 MB) download automatically on first run.
+Model weights (Grounding DINO base ~700 MB, SAM 2.1 base ~160 MB, Depth Anything V2 Small ~100 MB) download automatically on first run.
 
 ---
 
@@ -106,9 +107,9 @@ cd instance_segmentation_step
 python segmentation.py
 ```
 
-Detects the product (YOLO26 segmentation mask) and the A4 sheet (OpenCV: regions that are both *bright and smooth* — plain brightness thresholds fail against bright textured backgrounds) in each frame, after undistorting with the calibration data.
+Detects the product with Grounded-SAM — Grounding DINO finds it from a text prompt, SAM 2 turns the box into a pixel-precise mask — and the A4 sheet with OpenCV (regions that are both *bright and smooth* — plain brightness thresholds fail against bright textured backgrounds), after undistorting each frame with the calibration data.
 
-- Leave `PRODUCT_CLASS = None` (auto mode: highest-confidence non-person detection). Only set an explicit class name if auto mode grabs the wrong object. Note that the class *label* can be unstable on nano models (our bottle flip-flopped between "bottle" and "fire hydrant") while the mask itself stays accurate — auto mode is immune to this; strict class filtering is not.
+- Set `PRODUCT_PROMPT` at the top of the script to describe the product. Grounding DINO understands full descriptions, not just category labels — `'black cylindrical thermos'` works as well as `'bottle'`. If the product isn't found, try a more specific description or lower `BOX_THRESHOLD`/`TEXT_THRESHOLD` slightly.
 - Check `output/*_detections.jpg` — product mask tinted red, A4 quadrilateral in blue. Both should be found in every frame.
 
 ### 4 — Depth estimation + scale anchoring
@@ -168,4 +169,4 @@ These cost real debugging time; the code comments reference them.
 - **Recalibration pending**: current calibration is RMS 1.82 px from 14 images, with a suspicious fx (4513) vs fy (5005) mismatch (~10%, abnormal for a phone camera) that height measurements inherit via fy. Retake 20–30 checkerboard shots covering the full frame including corners. Because the calibration photos missed the frame edges, `segmentation.py` also deliberately skips ROI-cropping after undistortion.
 - **Only 1 ground-truth subject validated** — provisional; the brief calls for 3–5.
 - **Front-to-back depth not measured** — the output JSON's `depth` is `null`; requires a side-view capture set merged with the front-view JSON.
-- **Model scale**: currently the nano models for speed. If mask-edge tightness ever becomes the limiting error, `yolo26s-seg` (higher COCO mAP50:95) is the first lever.
+- **Model scale**: Grounding DINO base + SAM 2.1 base. If mask-edge tightness ever becomes the limiting error, `sam2.1_l.pt` (large) is the first lever; if detection recall is the problem, richer prompt wording usually beats a bigger model.

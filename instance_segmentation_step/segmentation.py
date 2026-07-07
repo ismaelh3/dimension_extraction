@@ -3,7 +3,10 @@ import numpy as np
 import os
 import json
 import pickle
-from ultralytics import YOLOE, SAM
+import torch
+from PIL import Image
+from ultralytics import SAM
+from transformers import AutoProcessor, AutoModelForZeroShotObjectDetection
 
 # -------------------------------------- Configuration --------------------------------------
 
@@ -11,25 +14,29 @@ SCRIPT_DIR  = os.path.dirname(os.path.abspath(__file__))  # folder this script l
 FRAMES_DIR  = os.path.join(SCRIPT_DIR, 'frames')          # folder containing your captured product frames
 OUTPUT_DIR  = os.path.join(SCRIPT_DIR, 'output')          # all results written here (local to this step)
 CALIB_FILE  = os.path.join(SCRIPT_DIR, '..', 'camera_calibration_step', 'output', 'calibration_data.pkl')
-YOLO_MODEL  = os.path.join(SCRIPT_DIR, 'yoloe-26s-seg.pt')  # YOLOE-26 small — open-vocabulary segmentation
+# Grounded-SAM: Grounding DINO FINDS the product (text-prompted, boxes only),
+# then SAM 2 segments whatever the box points at. Grounding DINO fuses a language
+# model into the detector, so it recognises far more than YOLO-family detectors —
+# full descriptions work as prompts, not just category labels. SAM 2 provides the
+# pixel-precise boundary that the measurement step reads dimensions from.
+DINO_MODEL = 'IDEA-Research/grounding-dino-base'       # downloads from HuggingFace on first run (~700 MB)
+SAM2_MODEL = os.path.join(SCRIPT_DIR, 'sam2.1_b.pt')   # downloads automatically on first run
 
-# What to segment. YOLOE is open-vocabulary: describe the product in a word or two
-# ('shoe', 'water bottle', 'cardboard box') — change this per product you measure.
-# The COCO-class limitation of plain YOLO does not apply here.
-PRODUCT_PROMPT = 'INSERT_PROMPT'
+# What to detect. Grounding DINO understands full descriptions, not just category
+# labels — 'black cylindrical thermos' or 'cardboard shipping box' both work.
+# Change this per product you measure. (The model expects lowercase text ending
+# in a period; normalise_prompt() applies that automatically.)
+PRODUCT_PROMPT = 'black shoe.'
 
-# Inference resolution. The measurements are taken from the mask's edges, so run the
-# network at a higher resolution than the default 640 for cleaner boundaries.
-IMG_SIZE = 1280
+# Detection thresholds. BOX: minimum confidence for a detection to count at all.
+# TEXT: how strongly the detection must match the words of the prompt.
+# Lower them if the product isn't being found; raise them if the wrong thing is.
+BOX_THRESHOLD  = 0.35
+TEXT_THRESHOLD = 0.25
 
-# SAM 2 mask refinement. YOLOE stays responsible for FINDING the product (its
-# open-vocabulary box), but its prototype-based masks are soft at object
-# boundaries — and the measurement step reads dimensions off exactly that
-# boundary. When enabled, YOLOE's box is passed to SAM 2 as a prompt and the
-# SAM 2 mask replaces YOLOE's. The raw YOLOE mask is still saved alongside
-# (*_product_mask_yoloe.png) so the two can be compared visually.
-SAM2_REFINE = True
-SAM2_MODEL  = os.path.join(SCRIPT_DIR, 'sam2.1_b.pt')  # downloads automatically on first run
+# Where to run Grounding DINO: Apple-Silicon GPU ('mps') when available, CPU
+# otherwise. If MPS ever throws an unsupported-operation error, hardcode 'cpu'.
+DEVICE = 'mps' if torch.backends.mps.is_available() else 'cpu'
 
 # A4 sheet is 210mm wide × 297mm tall (portrait).
 # These constants control how the detector decides what counts as an A4 sheet.
@@ -78,67 +85,73 @@ def undistort_frame(frame, camera_matrix, dist_coeffs):
     return undistorted, new_matrix
 
 
-# -------------------------------------- Product segmentation (YOLOE) --------------------------------------
+# -------------------------------------- Product detection (Grounding DINO) --------------------------------------
 
-def detect_product(frame, model):
+def normalise_prompt(prompt):
     """
-    Run YOLOE on the frame and return the mask + bounding box for the target product.
-
-    The model is text-prompted with PRODUCT_PROMPT (set up in main), so everything it
-    returns is already "the product" — no class filtering needed here. If several
-    instances match the prompt, the most confident one is kept.
-
-    retina_masks=True makes ultralytics build the mask at the original frame
-    resolution instead of the network's internal size — sharper edges, which matter
-    because the measurement step reads dimensions off this mask's boundary.
-
-    Returns the binary mask (white = product area), bounding box [x1,y1,x2,y2],
-    detected class name, and confidence score.
+    Grounding DINO's training data used prompts that are lowercase and end with a
+    period — matching that format measurably improves detection quality.
     """
-    results = model(frame, imgsz=IMG_SIZE, retina_masks=True, verbose=False)
-
-    best_conf      = 0.0
-    best_mask      = None
-    best_box       = None
-    best_class     = None
-
-    for result in results:
-        if result.masks is None:
-            continue
-
-        for i, cls_id in enumerate(result.boxes.cls):
-            conf = float(result.boxes.conf[i])
-            if conf <= best_conf:
-                continue  # keep only the most confident detection
-
-            best_conf  = conf
-            best_class = result.names[int(cls_id)]
-
-            raw_mask = result.masks.data[i].cpu().numpy()
-            h, w = frame.shape[:2]
-            if raw_mask.shape != (h, w):
-                raw_mask = cv2.resize(raw_mask, (w, h), interpolation=cv2.INTER_NEAREST)
-            best_mask = (raw_mask > 0.5).astype(np.uint8) * 255
-
-            box = result.boxes.xyxy[i].cpu().numpy().astype(int)
-            best_box = box.tolist()
-
-    return best_mask, best_box, best_class, best_conf
+    prompt = prompt.strip().lower()
+    return prompt if prompt.endswith('.') else prompt + '.'
 
 
-# -------------------------------------- SAM 2 mask refinement --------------------------------------
-
-def refine_mask_with_sam2(frame, box, sam_model):
+def detect_product(frame, processor, model):
     """
-    Re-segment the product with SAM 2, prompted by YOLOE's bounding box.
+    Run Grounding DINO on the frame and return the bounding box for the target product.
+
+    Grounding DINO is a text-prompted open-vocabulary detector: everything it returns
+    already matches PRODUCT_PROMPT, so no class filtering is needed. If several
+    instances match, the highest-scoring one is kept. It produces boxes only, no
+    masks — SAM 2 turns the winning box into a pixel-precise mask right after
+    (see segment_with_sam2).
+
+    Returns bounding box [x1,y1,x2,y2], the matched text label, and confidence
+    score — or (None, None, 0.0) when nothing matched the prompt.
+    """
+    # cv2 loads images as BGR; the HuggingFace processor expects RGB
+    rgb    = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+    inputs = processor(
+        images=Image.fromarray(rgb),
+        text=normalise_prompt(PRODUCT_PROMPT),
+        return_tensors='pt',
+    ).to(DEVICE)
+
+    with torch.no_grad():
+        outputs = model(**inputs)
+
+    h, w = frame.shape[:2]
+    results = processor.post_process_grounded_object_detection(
+        outputs,
+        inputs.input_ids,
+        threshold=BOX_THRESHOLD,
+        text_threshold=TEXT_THRESHOLD,
+        target_sizes=[(h, w)],
+    )[0]
+
+    if len(results['scores']) == 0:
+        return None, None, 0.0
+
+    best   = int(results['scores'].argmax())
+    box    = results['boxes'][best].cpu().numpy().astype(int).tolist()
+    labels = results.get('text_labels', results.get('labels'))
+    return box, str(labels[best]), float(results['scores'][best])
+
+
+# -------------------------------------- SAM 2 segmentation --------------------------------------
+
+def segment_with_sam2(frame, box, sam_model):
+    """
+    Segment the product with SAM 2, prompted by Grounding DINO's bounding box.
 
     SAM 2 is class-agnostic — it doesn't know what a 'bottle' is, it just
-    segments whatever object the box points at, with boundary quality that
-    YOLO-family mask heads can't match. The box prompt is what ties it to the
-    product YOLOE identified.
+    segments whatever object the box points at, with excellent boundary quality.
+    The box prompt is what ties it to the product Grounding DINO identified.
+    This is the classic Grounded-SAM pairing: DINO knows WHAT, SAM knows WHERE
+    the edges are.
 
     Returns a binary mask at frame resolution, or None if SAM 2 returned nothing
-    (caller keeps the YOLOE mask in that case).
+    (the frame is then treated as having no product and skipped downstream).
     """
     results = sam_model(frame, bboxes=[box], verbose=False)
     if not results or results[0].masks is None or len(results[0].masks.data) == 0:
@@ -283,12 +296,12 @@ def draw_detections(frame, product_mask, product_box, product_class, a4_corners,
 
 # -------------------------------------- Process a single frame --------------------------------------
 
-def process_frame(frame_path, model, camera_matrix, dist_coeffs, output_dir, sam_model=None):
+def process_frame(frame_path, dino_processor, dino_model, sam_model, camera_matrix, dist_coeffs, output_dir):
     """
     Full Step 3 pipeline for one frame:
       1. Load and undistort the image.
-      2. Detect the product with YOLO.
-      3. Optionally refine the product mask with SAM 2 (box-prompted).
+      2. Detect the product with Grounding DINO (text-prompted box).
+      3. Segment it with SAM 2 (box-prompted mask).
       4. Detect the A4 sheet with OpenCV.
       5. Save a labelled debug image.
       6. Return a result dict for this frame.
@@ -301,25 +314,21 @@ def process_frame(frame_path, model, camera_matrix, dist_coeffs, output_dir, sam
     # 1 — Remove lens distortion using calibration data
     frame, camera_matrix = undistort_frame(frame, camera_matrix, dist_coeffs)
 
-    # 2 — YOLO product segmentation
-    product_mask, product_box, product_class, product_conf = detect_product(frame, model)
-    mask_source = 'yoloe-26s-seg'
-    yoloe_mask  = None
-    if product_mask is None:
-        print(f"  [!] No product detected in {os.path.basename(frame_path)}")
+    # 2 — Grounding DINO product detection (box only)
+    product_box, product_class, product_conf = detect_product(frame, dino_processor, dino_model)
+    product_mask = None
+    mask_source  = 'grounding-dino-base + sam2.1_b'
+    if product_box is None:
+        print(f"  [!] No product matched '{PRODUCT_PROMPT}' in {os.path.basename(frame_path)}")
     else:
-        print(f"  [✓] Product detected  — class '{product_class}', confidence {product_conf:.2f}, box {product_box}")
+        print(f"  [✓] Product detected  — matched '{product_class}', confidence {product_conf:.2f}, box {product_box}")
 
-        # 3 — SAM 2 refinement: same product, sharper boundary
-        if sam_model is not None:
-            refined = refine_mask_with_sam2(frame, product_box, sam_model)
-            if refined is not None:
-                yoloe_mask   = product_mask   # kept for visual comparison
-                product_mask = refined
-                mask_source  = 'yoloe-26s-seg + sam2.1_b refine'
-                print(f"  [✓] Mask refined with SAM 2")
-            else:
-                print(f"  [!] SAM 2 returned no mask — keeping YOLOE mask")
+        # 3 — SAM 2 turns the box into a pixel-precise mask
+        product_mask = segment_with_sam2(frame, product_box, sam_model)
+        if product_mask is None:
+            print(f"  [!] SAM 2 returned no mask — frame will be skipped downstream")
+        else:
+            print(f"  [✓] Mask extracted with SAM 2")
 
     # 3 — OpenCV A4 sheet detection
     a4_corners, a4_box = detect_a4_sheet(frame)
@@ -335,14 +344,10 @@ def process_frame(frame_path, model, camera_matrix, dist_coeffs, output_dir, sam
     cv2.imwrite(debug_path, vis)
 
     # Save product mask as a separate image so later steps can load it directly.
-    # When SAM 2 refinement ran, the refined mask takes the canonical filename
-    # (downstream steps are unchanged) and the raw YOLOE mask is saved alongside.
     mask_path = None
     if product_mask is not None:
         mask_path = os.path.join(output_dir, f'{base_name}_product_mask.png')
         cv2.imwrite(mask_path, product_mask)
-    if yoloe_mask is not None:
-        cv2.imwrite(os.path.join(output_dir, f'{base_name}_product_mask_yoloe.png'), yoloe_mask)
 
     # 5 — Package results for this frame
     # NOTE: paths are stored as absolute so that later pipeline steps (which live in
@@ -401,20 +406,18 @@ def main():
     camera_matrix, dist_coeffs = load_calibration(CALIB_FILE)
     print("Calibration loaded.\n")
 
-    # Load the YOLOE segmentation model (downloads automatically on first run) and
-    # prompt it with the product description — after set_classes() the model only
-    # looks for that one thing, whatever it is.
-    print(f"Loading YOLOE model '{YOLO_MODEL}'...")
-    model = YOLOE(YOLO_MODEL)
-    model.set_classes([PRODUCT_PROMPT], model.get_text_pe([PRODUCT_PROMPT]))
-    print("Model ready.\n")
+    # Load Grounding DINO (detector). The prompt itself is passed per-frame in
+    # detect_product() — no per-class setup needed, that's the point of a
+    # language-grounded detector.
+    print(f"Loading Grounding DINO '{DINO_MODEL}' (device: {DEVICE})...")
+    dino_processor = AutoProcessor.from_pretrained(DINO_MODEL)
+    dino_model     = AutoModelForZeroShotObjectDetection.from_pretrained(DINO_MODEL).to(DEVICE).eval()
+    print("Grounding DINO ready.\n")
 
-    # Load SAM 2 for boundary refinement (optional — see SAM2_REFINE above)
-    sam_model = None
-    if SAM2_REFINE:
-        print(f"Loading SAM 2 model '{SAM2_MODEL}' for mask refinement...")
-        sam_model = SAM(SAM2_MODEL)
-        print("SAM 2 ready.\n")
+    # Load SAM 2 (mask producer — mandatory, since Grounding DINO gives boxes only)
+    print(f"Loading SAM 2 model '{SAM2_MODEL}'...")
+    sam_model = SAM(SAM2_MODEL)
+    print("SAM 2 ready.\n")
 
     os.makedirs(OUTPUT_DIR, exist_ok=True)
 
@@ -422,7 +425,7 @@ def main():
     all_results = []
     for i, fp in enumerate(frame_paths):
         print(f"Frame {i+1}/{len(frame_paths)}: {os.path.basename(fp)}")
-        result = process_frame(fp, model, camera_matrix, dist_coeffs, OUTPUT_DIR, sam_model)
+        result = process_frame(fp, dino_processor, dino_model, sam_model, camera_matrix, dist_coeffs, OUTPUT_DIR)
         if result:
             all_results.append(result)
         print()
@@ -444,8 +447,9 @@ def main():
 
     if product_ok < total:
         print("\n[!] Product missed in some frames.")
-        print("    Try rewording PRODUCT_PROMPT at the top of this file (e.g. 'sneaker'")
-        print("    instead of 'shoe'), or put more light on the product.")
+        print("    Try a more descriptive PRODUCT_PROMPT at the top of this file (Grounding")
+        print("    DINO handles full descriptions, e.g. 'black cylindrical thermos'), or")
+        print("    lower BOX_THRESHOLD / TEXT_THRESHOLD slightly (e.g. 0.30 / 0.20).")
 
     if a4_ok < total:
         print("\n[!] A4 sheet missed in some frames.")

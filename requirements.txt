@@ -4,10 +4,11 @@
 numpy==2.5.0
 opencv-python==4.13.0.92
 
-# Product + reference-object instance segmentation (YOLO26)
+# SAM 2 product mask (Grounded-SAM, mask half)
 ultralytics==8.4.84
 
-# Monocular depth estimation (Depth Anything V2 via HuggingFace)
+# Grounding DINO product detection (Grounded-SAM, detector half) +
+# monocular depth estimation (Depth Anything V2) — both via HuggingFace
 torch==2.12.1
 torchvision==0.27.1
 transformers==5.12.1

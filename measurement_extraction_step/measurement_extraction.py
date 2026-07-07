@@ -229,15 +229,15 @@ def robust_average(values):
 
 def get_segmentation_model_label():
     """
-    Read which mask source Step 3 actually used (plain YOLOE, or YOLOE + SAM 2
-    refinement) so the output JSON records the truth rather than a hardcoded name.
+    Read which mask source Step 3 actually used (e.g. Grounding DINO + SAM 2)
+    so the output JSON records the truth rather than a hardcoded name.
     """
     try:
         with open(SEG_RESULTS) as f:
             entries = json.load(f)
-        return entries[0].get('mask_source', 'yoloe-26s-seg')
+        return entries[0].get('mask_source', 'unknown')
     except Exception:
-        return 'yoloe-26s-seg'
+        return 'unknown'
 
 
 def main():
