@@ -2,12 +2,14 @@ import numpy as np
 import os
 import json
 import glob
+import pickle
 from datetime import datetime
 
 # ─── Configuration ────────────────────────────────────────────────────────────
 
 SCRIPT_DIR        = os.path.dirname(os.path.abspath(__file__))  # folder this script lives in, so paths work from any cwd
 MEASUREMENTS_DIR  = os.path.join(SCRIPT_DIR, '..', 'measurement_extraction_step', 'output')
+CALIBRATION_FILE  = os.path.join(SCRIPT_DIR, '..', 'camera_calibration_step', 'output', 'calibration_data.pkl')
 GROUND_TRUTH_FILE = os.path.join(SCRIPT_DIR, 'ground_truth.json')
 OUTPUT_DIR        = os.path.join(SCRIPT_DIR, 'output')
 HISTORY_FILE      = os.path.join(OUTPUT_DIR, 'accuracy_history.jsonl')
@@ -39,6 +41,24 @@ def load_ground_truth(path):
     with open(path) as f:
         data = json.load(f)
     return {k: v for k, v in data.items() if not k.startswith('_')}
+
+
+def load_calibration_fingerprint(path):
+    """
+    Identify which camera calibration was active for this run, so history
+    entries taken under different calibrations can be told apart (the whole
+    point of the history file is answering "did that recalibration help?").
+    """
+    if not os.path.exists(path):
+        return None
+    with open(path, 'rb') as f:
+        data = pickle.load(f)
+    matrix = data['camera_matrix']
+    return {
+        'rms_reprojection_px': round(float(data['reprojection_error']), 3),
+        'fx': round(float(matrix[0][0]), 1),
+        'fy': round(float(matrix[1][1]), 1),
+    }
 
 
 def load_pipeline_measurements(directory):
@@ -252,10 +272,15 @@ def main():
         json.dump(report, f, indent=2)
 
     # Append a one-line summary to the history log so accuracy can be tracked
-    # across pipeline changes over time (e.g. did last week's calibration fix help?)
+    # across pipeline changes over time (e.g. did last week's calibration fix help?).
+    # subject_ids + the calibration fingerprint make entries comparable later:
+    # without them there is no way to tell WHAT was measured or under WHICH
+    # calibration once the measurement files are cleaned up.
     history_entry = {
         'validated_at':       report['validated_at'],
         'validated_subjects':  validated_subjects,
+        'subject_ids':         sorted(set(r['subject_id'] for r in all_results)),
+        'calibration':         load_calibration_fingerprint(CALIBRATION_FILE),
         'overall_pass':        overall_pass,
         'overall_accuracy_pct': overall_accuracy_pct,
         'mean_abs_error_cm':  {dim: s['mean_abs_error_cm'] for dim, s in summary.items()},

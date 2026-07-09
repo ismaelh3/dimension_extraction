@@ -96,12 +96,12 @@ def normalise_prompt(prompt):
     return prompt if prompt.endswith('.') else prompt + '.'
 
 
-def detect_product(frame, processor, model):
+def detect_product(frame, processor, model, prompt):
     """
     Run Grounding DINO on the frame and return the bounding box for the target product.
 
     Grounding DINO is a text-prompted open-vocabulary detector: everything it returns
-    already matches PRODUCT_PROMPT, so no class filtering is needed. If several
+    already matches the given prompt, so no class filtering is needed. If several
     instances match, the highest-scoring one is kept. It produces boxes only, no
     masks — SAM 2 turns the winning box into a pixel-precise mask right after
     (see segment_with_sam2).
@@ -113,7 +113,7 @@ def detect_product(frame, processor, model):
     rgb    = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
     inputs = processor(
         images=Image.fromarray(rgb),
-        text=normalise_prompt(PRODUCT_PROMPT),
+        text=normalise_prompt(prompt),
         return_tensors='pt',
     ).to(DEVICE)
 
@@ -315,7 +315,7 @@ def process_frame(frame_path, dino_processor, dino_model, sam_model, camera_matr
     frame, camera_matrix = undistort_frame(frame, camera_matrix, dist_coeffs)
 
     # 2 — Grounding DINO product detection (box only)
-    product_box, product_class, product_conf = detect_product(frame, dino_processor, dino_model)
+    product_box, product_class, product_conf = detect_product(frame, dino_processor, dino_model, PRODUCT_PROMPT)
     product_mask = None
     mask_source  = 'grounding-dino-base + sam2.1_b'
     if product_box is None:

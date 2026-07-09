@@ -3,14 +3,15 @@
 Extract real-world **product dimensions (cm) from ordinary RGB photos** — no LiDAR, no depth sensor. An iPhone photo of a product next to an A4 sheet of paper goes in; a structured JSON with validated width/height measurements comes out, ready for 3D asset generation.
 
 **Target accuracy: under 2 cm** on major dimensions.
-**Current validated accuracy: ±0.9 cm** against tape-measure ground truth. ✅
+**Current validated accuracy: 2 of 3 products fully within tolerance** against tape-measure ground truth.
 
-| | Pipeline | Tape measure | Error |
-|---|---|---|---|
-| Width | 10.1 ± 0.39 cm | 9.19 cm | +0.91 cm |
-| Height | 26.6 ± 0.35 cm | 25.73 cm | +0.87 cm |
+| Product (validated 2026-07-07) | Width err | Height err | Depth err | Verdict |
+|---|---|---|---|---|
+| Handbag | 0.25 cm | 0.47 cm | 0.76 cm | PASS (97.8%) |
+| Nike sneaker | 1.78 cm | 0.33 cm | 0.83 cm | PASS (94.8%) |
+| Converse sneaker | 3.28 cm | 1.11 cm | 1.19 cm | FAIL (90.1%) |
 
-*(7-frame capture of a test bottle; the remaining +0.9 cm is a known systematic bias from the A4 sheet standing ~7 cm behind the product — see [Capture Protocol](#2--capture-protocol).)*
+*(Mean absolute error vs. tape measure, one capture set per product. The one failure is the known coplanarity trap — the A4 sheet was taped to the wall behind the product instead of standing in its plane; see [Capture Protocol](#2--capture-protocol). The camera was recalibrated on 2026-07-08 — all numbers above predate it and should improve on re-validation.)*
 
 ---
 
@@ -47,8 +48,9 @@ Dimension Extraction/
 ├── camera_calibration_step/      ① capture-images.py, camera_calibration.py,
 │                                    checkerboard_9x7_2.5cm.pdf
 ├── instance_segmentation_step/   ② segmentation.py  (+ frames/ — your photos go here)
+│                                    prompt_robustness.py, prompt_robustness_results.md
 ├── depth_estimation_step/        ③ depth_estimation.py
-├── measurement_extraction_step/  ④ measurement_extraction.py
+├── measurement_extraction_step/  ④ measurement_extraction.py, merge_views.py
 ├── accuracy_validation_step/     ⑤ accuracy_validation.py, ground_truth.json
 ├── dimension_extraction_brief.md    full technical brief
 └── requirements.txt
@@ -86,7 +88,9 @@ cd camera_calibration_step
 python camera_calibration.py
 ```
 
-Outputs `output/calibration_data.pkl` (camera matrix + distortion coefficients) plus a worst-first per-image error report (`output/reprojection_errors.txt`) so you can spot and retake the images dragging the RMS up. Target: RMS reprojection error **< 1.0 px** (lower = better; everything downstream inherits this quality).
+Outputs `output/calibration_data.pkl` (camera matrix + distortion coefficients) plus a worst-first per-image error report (`output/reprojection_errors.txt`) so you can spot and retake the images dragging the RMS up.
+
+Target: RMS reprojection error **< 1.0 px** (lower = better; everything downstream inherits this quality). Our result: **1.59 px RMS from 79 images**. Part of that residual is inherent to phone cameras — the lens geometry changes slightly between shots (optical image stabilisation floats the lens, autofocus shifts the effective focal length, and in-camera processing warps each frame a little differently), so one distortion model can never fit every image perfectly — and part may be our capture conditions (lighting, motion blur, print flatness). We accepted it because at a 0.75 m working distance 1.59 px corresponds to ~0.3 mm on the object, far below the pipeline's other error sources. Also check the fx/fy agreement in the camera matrix (ours: 4370 vs 4369, 0.04%) — a mismatch there is a *systematic* scale error on every height measurement, which no amount of frame averaging can fix.
 
 ### 2 — Capture protocol
 
@@ -96,7 +100,7 @@ Accuracy is won or lost here. For each product:
 - **A4 sheet standing in the same plane as the product's front face** — right next to it, **not behind it**. The product's distance is taken from the sheet, so every cm of gap between their planes becomes a proportional error on every dimension (measured: a 7 cm gap → +10% / +0.9 cm on both width and height)
 - Plain, high-contrast background; even diffuse lighting, no harsh shadows
 - **Minimum 5 frames** — measurements are averaged with outlier rejection
-- Front view gives width + height; front-to-back depth needs a separate side-view capture set
+- Front view gives width + height; front-to-back depth needs a separate side-view capture set (merged in step 5 by `merge_views.py`)
 
 Put the frames in `instance_segmentation_step/frames/`.
 
@@ -109,8 +113,10 @@ python segmentation.py
 
 Detects the product with Grounded-SAM — Grounding DINO finds it from a text prompt, SAM 2 turns the box into a pixel-precise mask — and the A4 sheet with OpenCV (regions that are both *bright and smooth* — plain brightness thresholds fail against bright textured backgrounds), after undistorting each frame with the calibration data.
 
-- Set `PRODUCT_PROMPT` at the top of the script to describe the product. Grounding DINO understands full descriptions, not just category labels — `'black cylindrical thermos'` works as well as `'bottle'`. If the product isn't found, try a more specific description or lower `BOX_THRESHOLD`/`TEXT_THRESHOLD` slightly.
-- Check `output/*_detections.jpg` — product mask tinted red, A4 quadrilateral in blue. Both should be found in every frame.
+- Set `PRODUCT_PROMPT` at the top of the script. **Use a simple noun plus at most one attribute** — `'black shoe'`, `'red handbag'`. Measured across the three validated products ([full data](instance_segmentation_step/prompt_robustness_results.md)), this form consistently scored ~0.9 confidence, while stacked adjectives only drained confidence (a 10-word description scored ~0.5) without changing the box at all — prompt wording affects how *reliably* frames detect, not what gets measured.
+- If frames are missed, **simplify the prompt before lowering `BOX_THRESHOLD`/`TEXT_THRESHOLD`** — plain wording recovers margin; lowering thresholds moves the cliff toward the noise floor.
+- Don't read high confidence as proof the description matched: wrong-color prompts scored 0.86–0.90 on all three test products. Check `output/*_detections.jpg` — product mask tinted red (the tint recolors the product, so don't judge its true color there), A4 quadrilateral in blue. Both should be found in every frame.
+- To vet prompts for a new product empirically, use `prompt_robustness.py` (see the results doc for how).
 
 ### 4 — Depth estimation + scale anchoring
 
@@ -134,6 +140,14 @@ python measurement_extraction.py    # set SUBJECT_ID at the top per product
 Projects the product mask's tight bounding box through the pinhole model at the A4-derived distance; averages across frames rejecting outliers beyond 1σ. Output: `output/measurements_<subject_id>.json` with dimensions, per-frame precision (±), capture metadata (resolution, mm-per-pixel), and model versions.
 
 The per-frame log prints the depth-map median next to the A4 distance as a diagnostic — a large gap between them means the A4 wasn't coplanar with the product (or the depth model misread the scene).
+
+For full 3-D dimensions, run steps 3–5 once on a front capture set and once on a side set, then:
+
+```bash
+python merge_views.py    # optionally: SUBJECT=<subject_id> python merge_views.py
+```
+
+It maps the side view's silhouette width to the product's front-to-back **depth**, and cross-checks the two views' independent height measurements against each other (they must agree within 1.5 cm — a bigger gap means the two capture sets are inconsistent, usually different A4 placement, and the depth number shouldn't be trusted). The merged `output/measurements_<subject_id>.json` is what step 6 validates.
 
 ### 6 — Accuracy validation
 
@@ -166,7 +180,8 @@ These cost real debugging time; the code comments reference them.
 
 ## Known limitations / next steps
 
-- **Recalibration pending**: current calibration is RMS 1.82 px from 14 images, with a suspicious fx (4513) vs fy (5005) mismatch (~10%, abnormal for a phone camera) that height measurements inherit via fy. Retake 20–30 checkerboard shots covering the full frame including corners. Because the calibration photos missed the frame edges, `segmentation.py` also deliberately skips ROI-cropping after undistortion.
-- **Only 1 ground-truth subject validated** — provisional; the brief calls for 3–5.
-- **Front-to-back depth not measured** — the output JSON's `depth` is `null`; requires a side-view capture set merged with the front-view JSON.
-- **Model scale**: Grounding DINO base + SAM 2.1 base. If mask-edge tightness ever becomes the limiting error, `sam2.1_l.pt` (large) is the first lever; if detection recall is the problem, richer prompt wording usually beats a bigger model.
+- **Re-validate under the new calibration.** The camera was recalibrated on 2026-07-08: RMS 1.59 px from 79 full-frame-coverage images (previously 1.82 px from 14), and the old fx 4513 vs fy 5005 mismatch — a ~10% systematic bias that every height measurement inherited — is resolved (now 4370 vs 4369). All entries in `accuracy_history.jsonl` predate this calibration, so the pipeline should be re-run on the capture sets and re-validated to measure the improvement. The remaining 1.59 px RMS is accepted for now (~0.3 mm at working distance — see step 1); better capture conditions might still push it under the 1.0 px target.
+- **One capture set still violates the protocol** — the Converse set has the A4 sheet taped to the wall behind the product, which is why it fails validation (width −3.28 cm). Re-capture with the sheet standing in the product's plane.
+- **Validation is one capture set per product** — the brief calls for 3–5 subjects validated together; run them through step 6 as a batch once re-captured.
+- **Model scale**: Grounding DINO base + SAM 2.1 base. If mask-edge tightness ever becomes the limiting error, `sam2.1_l.pt` (large) is the first lever; if detection recall is the problem, *simplify* the prompt first — the prompt-robustness pass measured plain noun-plus-one-attribute prompts as the strongest form on every product tested.
+- **Prompt attributes are not verified against pixels** — a wrong-color prompt still boxes the salient object with high confidence. Untested: scenes with two similar objects; keep one product per frame per the capture protocol.
