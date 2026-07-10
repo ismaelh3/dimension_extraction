@@ -96,6 +96,10 @@ def calibrate_camera():
     calibration_data = {
         'camera_matrix': mtx,
         'distortion_coefficients': dist,
+        # Resolution the matrix is valid at (w, h). fx/fy/cx/cy are in PIXELS of
+        # this image size — frames captured at any other resolution must have the
+        # matrix rescaled before use (segmentation.py does this per frame).
+        'image_size_wh': tuple(gray.shape[::-1]),
         'rotation_vectors': rvecs,
         'translation_vectors': tvecs,
         'reprojection_error': ret,

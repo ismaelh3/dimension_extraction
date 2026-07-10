@@ -59,10 +59,47 @@ A4_BRIGHTNESS_MIN     = 150  # local mean brightness (0-255) must be above this 
 # -------------------------------------- Load calibration data --------------------------------------
 
 def load_calibration(path):
-    """Read the camera matrix and distortion coefficients saved by camera_calibration.py."""
+    """
+    Read the camera matrix, distortion coefficients, and the image resolution the
+    matrix is valid at, saved by camera_calibration.py.
+    """
     with open(path, 'rb') as f:
         data = pickle.load(f)
-    return data['camera_matrix'], data['distortion_coefficients']
+    calib_size_wh = data.get('image_size_wh')
+    if calib_size_wh is None:
+        print("[!] Calibration file has no 'image_size_wh' — re-run camera_calibration.py.")
+        print("    Without it, frames at a different resolution than the calibration shots")
+        print("    get a mis-scaled camera matrix (silently wrong distances). Assuming every")
+        print("    frame matches the calibration resolution.")
+    return data['camera_matrix'], data['distortion_coefficients'], calib_size_wh
+
+
+def scale_matrix_to_frame(camera_matrix, calib_size_wh, frame_size_wh):
+    """
+    Rescale the calibration matrix to a frame captured at a different resolution.
+
+    fx/fy/cx/cy are in PIXELS of the calibration images, so a frame the camera
+    saved at another resolution (iPhones silently switch 48MP/12MP) needs them
+    multiplied by the resolution ratio. Without this, the pinhole distance
+    estimate is off by exactly that ratio and undistortion warps the image
+    (masks/quads land hundreds of px from where they belong at 12MP).
+    Distortion coefficients are normalized and need no scaling.
+    """
+    if calib_size_wh is None or tuple(frame_size_wh) == tuple(calib_size_wh):
+        return camera_matrix
+    sx = frame_size_wh[0] / calib_size_wh[0]
+    sy = frame_size_wh[1] / calib_size_wh[1]
+    if abs(sx - sy) > 0.01 * sx:
+        print(f"  [!] Frame aspect ratio differs from calibration "
+              f"({frame_size_wh} vs {calib_size_wh}) — matrix scaling is approximate.")
+    scaled = camera_matrix.copy()
+    scaled[0, 0] *= sx  # fx
+    scaled[0, 2] *= sx  # cx
+    scaled[1, 1] *= sy  # fy
+    scaled[1, 2] *= sy  # cy
+    print(f"  [i] Frame is {frame_size_wh[0]}x{frame_size_wh[1]} but calibration is "
+          f"{calib_size_wh[0]}x{calib_size_wh[1]} — camera matrix rescaled x{sx:.3f}.")
+    return scaled
 
 
 # -------------------------------------- Undistort frame --------------------------------------
@@ -188,7 +225,15 @@ def detect_a4_sheet(frame):
       2. Keep only regions that are both bright and low-variance ("paper-like").
       3. Find contours and filter by area and shape.
       4. Approximate each contour to a polygon and keep 4-sided ones.
-      5. Choose the candidate whose aspect ratio is closest to A4 (1.414).
+      5. Gate candidates by aspect ratio, then choose the LARGEST one.
+
+    Aspect ratio is a gate, not a ranking: the detected bbox of the real sheet
+    reads 1.36-1.47 depending on tilt and how far the bright-smooth region bleeds
+    into the wall/stand, while small background patches (bare wall between
+    furniture) can land closer to the ideal ratio by pure luck. Ranking by
+    closest-aspect made the winner flip frame to frame; the sheet is reliably
+    the most PROMINENT paper-like quad in a capture that follows the protocol,
+    so area decides among survivors.
 
     Returns the 4-corner polygon (numpy array shape [4,2]) and bounding rect,
     or (None, None) if nothing plausible is found.
@@ -216,9 +261,9 @@ def detect_a4_sheet(frame):
     # Step 4 — find all contours in the mask
     contours, _ = cv2.findContours(white_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
 
-    best_candidate  = None
-    best_box        = None
-    best_ratio_diff = float('inf')
+    best_candidate = None
+    best_box       = None
+    best_area      = 0.0
 
     for cnt in contours:
         area = cv2.contourArea(cnt)
@@ -248,11 +293,11 @@ def detect_a4_sheet(frame):
         if ratio_diff > A4_ASPECT_TOLERANCE:
             continue  # shape is not A4-like enough
 
-        # Keep the candidate with ratio closest to ideal A4
-        if ratio_diff < best_ratio_diff:
-            best_ratio_diff = ratio_diff
-            best_candidate  = approx.reshape(4, 2)
-            best_box        = [x, y, x + bw, y + bh]
+        # Keep the largest candidate that survived every gate
+        if area > best_area:
+            best_area      = area
+            best_candidate = approx.reshape(4, 2)
+            best_box       = [x, y, x + bw, y + bh]
 
     return best_candidate, best_box
 
@@ -299,7 +344,7 @@ def draw_detections(frame, product_mask, product_box, product_class, a4_corners,
 
 # -------------------------------------- Process a single frame --------------------------------------
 
-def process_frame(frame_path, dino_processor, dino_model, sam_model, camera_matrix, dist_coeffs, output_dir):
+def process_frame(frame_path, dino_processor, dino_model, sam_model, camera_matrix, dist_coeffs, calib_size_wh, output_dir):
     """
     Full Step 3 pipeline for one frame:
       1. Load and undistort the image.
@@ -314,7 +359,9 @@ def process_frame(frame_path, dino_processor, dino_model, sam_model, camera_matr
         print(f"  [!] Could not read: {frame_path}")
         return None
 
-    # 1 — Remove lens distortion using calibration data
+    # 1 — Remove lens distortion using calibration data (matrix rescaled first if
+    #     this frame's resolution differs from the calibration shots)
+    camera_matrix = scale_matrix_to_frame(camera_matrix, calib_size_wh, frame.shape[1::-1])
     frame, camera_matrix = undistort_frame(frame, camera_matrix, dist_coeffs)
 
     # 2 — Grounding DINO product detection (box only)
@@ -406,7 +453,7 @@ def main():
 
     # Load calibration data produced by camera_calibration.py
     print(f"Loading calibration data from '{CALIB_FILE}'...")
-    camera_matrix, dist_coeffs = load_calibration(CALIB_FILE)
+    camera_matrix, dist_coeffs, calib_size_wh = load_calibration(CALIB_FILE)
     print("Calibration loaded.\n")
 
     # Load Grounding DINO (detector). The prompt itself is passed per-frame in
@@ -428,7 +475,7 @@ def main():
     all_results = []
     for i, fp in enumerate(frame_paths):
         print(f"Frame {i+1}/{len(frame_paths)}: {os.path.basename(fp)}")
-        result = process_frame(fp, dino_processor, dino_model, sam_model, camera_matrix, dist_coeffs, OUTPUT_DIR)
+        result = process_frame(fp, dino_processor, dino_model, sam_model, camera_matrix, dist_coeffs, calib_size_wh, OUTPUT_DIR)
         if result:
             all_results.append(result)
         print()
