@@ -14,5 +14,12 @@ torchvision==0.27.1
 transformers==5.12.1
 pillow==12.3.0
 
+# Stage 3 — silhouette reconstruction + .glb export (asset_generation_step)
+scikit-image==0.26.0
+trimesh==4.12.2
+pygltflib==1.16.5
+fast-simplification==0.1.13
+
 # Optional — 3D point-cloud visualisation during development only
 # open3d
+# matplotlib  (debug mesh previews)

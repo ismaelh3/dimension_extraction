@@ -1,5 +1,5 @@
 
-.PHONY: help setup camera-calibration instance-segmentation depth-estimation measurement-extraction merge-views accuracy-validation diagnostic-overlay full-pipeline clean-images clean-frames clean-some-outputs clean-outputs clean-all
+.PHONY: help setup camera-calibration instance-segmentation depth-estimation measurement-extraction merge-views accuracy-validation diagnostic-overlay build-asset full-pipeline clean-images clean-frames clean-some-outputs clean-outputs clean-all
 
 VENV = venv
 PYTHON = $(VENV)/bin/python
@@ -13,6 +13,7 @@ help:
 	@echo "  VIEW=side make measurement-extraction		* Measure a side-view capture set (default: front)"
 	@echo "  make merge-views				* Combine front+side views into the final measurements JSON"
 	@echo "  SUBJECT=x VIEW=side make diagnostic-overlay	* Render what the measurement step used (mask, bbox, endpoints, A4 quad)"
+	@echo "  SUBJECT=x make build-asset			* Stage 3: build the real-world-scaled .glb from silhouette masks"
 	@echo "  make clean-all    				* Remove build artifacts and clear outputs"
 
 setup: requirements.txt
@@ -48,6 +49,10 @@ diagnostic-overlay:
 accuracy-validation:
 	@echo "running accuracy validation step..."
 	@$(PYTHON) accuracy_validation_step/accuracy_validation.py
+
+build-asset:
+	@echo "building silhouette-hull mesh (Stage 3)..."
+	@$(PYTHON) asset_generation_step/build_silhouette_mesh.py
 
 most-pipeline: instance-segmentation depth-estimation measurement-extraction merge-views
 	@echo "running the majority of the pipeline"

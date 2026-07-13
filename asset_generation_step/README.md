@@ -94,13 +94,41 @@ product needs a **top view** (or any additional carving view):
 - Capture note: shoot as close to straight-down (perpendicular) as you can; a tilted
   top view distorts the silhouette's *shape*. Size is immune either way — the bbox
   normalization absorbs it — but shape is the whole point of the extra view
+- **Top vs bottom:** they produce the *identical* carving constraint (a silhouette
+  along the vertical axis is the same from above and below, mirrored) — one is
+  enough for geometry; capture both only for mask redundancy or future texturing.
+  For a bottom shot, roll the product upside down about its front-back axis so its
+  front still faces you, then shoot straight down
 
 The same logic applies to the front/side masks used in carving: the full pipeline ran
 on those sets to produce *measurements*; the carve itself only reads the masks + JSON.
 
-### The script to build: `build_silhouette_mesh.py`
+### The script: `build_silhouette_mesh.py` (BUILT — pilot-validated 2026-07-10)
 
-Behaviour spec, step by step:
+```bash
+# 1. after running segmentation on a capture set, file its masks by view:
+mkdir -p asset_generation_step/masks/<subject_id>/<view>   # front|side|back|top|bottom
+cp instance_segmentation_step/output/*_product_mask.png \
+   asset_generation_step/masks/<subject_id>/<view>/
+# (segmentation output is overwritten per capture set — file masks away
+#  before running the next set)
+
+# 2. build:
+SUBJECT=<subject_id> make build-asset
+# knobs: RESOLUTION (voxels along longest axis, default 512) ·
+#        TARGET_FACES (0 = uncapped, the default — set only to cap for a delivery target) ·
+#        SIDE_FROM=left (default right — which side the side set was shot from) ·
+#        FILL_HOLES (views whose enclosed mask holes get filled per frame,
+#          default top,bottom — reflections on glass/gloss punch false holes
+#          that would carve tunnels; set to exclude any view where the object
+#          has a REAL through-hole, e.g. a mug handle. Also takes all/none)
+```
+
+**Quality-first policy:** triangle count and file size are NOT limited — the only
+limit is the best result the masks can support. The 512³ default runs in ~12s /
+1.3GB RAM on the M1; raise RESOLUTION further if masks ever out-resolve it.
+
+What it does, step by step:
 
 1. **Load inputs** — Stage 2 JSON, the best front mask and best side mask (sharpest
    frame; the segmentation output JSON has per-frame confidence to pick by).
@@ -192,22 +220,25 @@ Never ship a file this script hasn't passed. It re-loads the *final* `.glb` and 
    2cm target. Catches axis mix-ups and cm/m bugs, the two most likely failures
 2. **Units/orientation:** height is along +Y; no dimension is 100× off (the classic)
 3. **Integrity:** watertight/manifold status reported; triangle count; colors or
-   textures present (textures ≤2048px)
-4. **Spec compliance:** shells out to `gltf-validator`, fails on errors
-5. Writes `output/<subject_id>_asset_report.json` — the Stage 3 analogue of Stage 2's
+   textures present (reported, not capped)
+4. **Shape (reprojection IoU):** re-projects the mesh orthographically onto each
+   view and measures overlap with that view's voted silhouette. The snowglobe
+   pilot scores 0.99; a drop below ~0.95 signals a shape defect the bbox can't
+   see (this check caught a decimation-quality bug during the pilot)
+5. **Spec compliance:** shells out to `gltf-validator`, fails on errors
+6. Writes `output/<subject_id>_asset_report.json` — the Stage 3 analogue of Stage 2's
    accuracy report: pass/fail per check, measured-vs-asset table, tolerances used
 
 Plus one human check in gltf-viewer next to a product photo: the script can't see
 that the shape lost a feature or the colors landed wrong.
 
-## Optimize + final export
+## Final export
 
-```bash
-gltfpack -i work/<id>_hull.glb -o output/<id>.glb -cc -tc
-```
-(-cc = mesh compression, -tc = texture compression.) Re-run `validate_glb.py` on the
-*output* file — compression must not have moved the bbox. Delivery budget for web/AR:
-**≤ 50k triangles, ≤ 2K textures, ≤ 10MB** per asset.
+Quality-first: the validated hull ships as-is — `cp work/<id>_hull.glb output/<id>.glb`.
+No decimation, no compression by default; gltfpack's `-cc` quantization is lossy and
+only worth it if a specific delivery channel later demands smaller files (in that
+case re-run `validate_glb.py` on the compressed file — compression must not move
+the bbox — or rebuild with `TARGET_FACES` set instead).
 
 ---
 
@@ -216,9 +247,10 @@ gltfpack -i work/<id>_hull.glb -o output/<id>.glb -cc -tc
 ```
 asset_generation_step/
 ├── README.md                      ← this file
-├── build_silhouette_mesh.py       to build — Route C reconstruction (the main event)
+├── build_silhouette_mesh.py       BUILT — Route C reconstruction (the main event)
 ├── validate_glb.py                to build — validation gate
-├── work/                          intermediates (<id>_hull.glb, debug voxel dumps)
+├── masks/<subject_id>/<view>/     per-view mask PNGs, filed away after each segmentation run
+├── work/                          intermediates (<id>_hull.glb, debug previews)
 ├── output/
 │   ├── <subject_id>.glb           ← the deliverable
 │   └── <subject_id>_asset_report.json
@@ -244,15 +276,16 @@ and sit under the 10MB budget.
 - [ ] Upright (+Y), front-facing (+Z), origin at bottom-center, real-world metres
 - [ ] `validate_glb.py` passes — all three dimensions within tolerance of Stage 2 JSON
 - [ ] `gltf-validator` reports zero errors
-- [ ] Within the 50k-tri / 2K-texture / 10MB budget
+- [ ] Built at full quality — default RESOLUTION or higher, no face cap
 - [ ] Provenance metadata embedded in `extras`
 - [ ] `<subject_id>_asset_report.json` committed alongside
 
 ## Milestones
 
-1. **M1 — Pilot (snowglobe):** it already has merged front+side measurements and
-   masks. Build `build_silhouette_mesh.py` (geometry only, single flat color),
-   build `validate_glb.py`, get the first validated `.glb`. Proves the whole chain
+1. **M1 — Pilot (snowglobe):** ⏳ geometry DONE (2026-07-10) —
+   `work/snowglobe_hull.glb` @ 512³: 2.05M triangles, watertight, bbox exactly
+   10.40 × 13.70 × 10.20 cm, reprojection IoU 0.996 vs both views' silhouettes.
+   Remaining: build `validate_glb.py`, then copy to `output/` as the first deliverable
 2. **M2 — Color:** vertex-color sampling from the front photo (v1), then evaluate
    whether projected UV textures (v2) are worth it
 3. **M3 — Top view (optional but likely):** add a top-view capture set for one curved
@@ -267,10 +300,11 @@ and sit under the 10MB budget.
 |---------|--------------|-----|
 | Asset 100× too big/small in a viewer | cm vs m mixed | Unit conversion at grid build; validator check 2 catches it |
 | Width and depth swapped | Front/side masks assigned to wrong grid faces | Axis mapping in carve step; the bbox check catches it |
-| Mesh looks like blocky staircase | Voxel resolution too low / no smoothing | Raise grid to 384–512³, apply Laplacian pass |
+| Mesh looks like blocky staircase | Voxel resolution too low / no smoothing | Raise RESOLUTION above the 512 default |
 | Product's hollow/handle came out solid | Concavity — silhouettes can't see it | Expected; add top view, or fall back to Route A |
 | Curved product looks inflated | Two-view hull limit | Add top view (M3); dims are still exact |
 | Ragged/noisy hull edges | Speckled or leaky mask on the chosen frame | Pick a different frame; strengthen morphology cleanup |
+| Tunnel/pit carved through the hull | Reflections (glass/gloss) punched false holes in a view's masks | Add that view to `FILL_HOLES` (top,bottom already default) |
 | Colors misaligned on the mesh | Mask crop offset vs photo coordinates | Project with the same tight-bbox offsets used in carving |
 
 ## What to read / look into next
