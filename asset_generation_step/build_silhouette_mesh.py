@@ -59,7 +59,30 @@ FILL_HOLES = os.environ.get('FILL_HOLES', 'top,bottom')
 CROSS_SECTION = os.environ.get('CROSS_SECTION', 'silhouette')
 
 VOTE_FRACTION     = 0.5   # pixel kept if inside >= this fraction of a view's masks
-SMOOTH_ITERATIONS = 10
+# taubin iterations: 10 leaves faint voxel-staircase ridges visible on smooth
+# curved products; ~30 flattens them (finalize()'s exact-bbox rescale undoes
+# the extra shrinkage, so more iterations cost time, not size accuracy)
+SMOOTH_ITERATIONS = int(os.environ.get('SMOOTH_ITERATIONS', '10'))
+# CROSS_SECTION=round only: gaussian sigma (in voxel rows) applied to the
+# lathe's per-height profile (centers + radii). Mask-edge noise jitters each
+# row's span independently, which reads as horizontal rings on the surface;
+# smoothing the profile removes the rings while following the real shape.
+# 0 = off. ~2 is enough; big values start rounding real grooves away.
+PROFILE_SMOOTH    = float(os.environ.get('PROFILE_SMOOTH', '0'))
+# gaussian sigma (voxels) applied to each view's vote fraction BEFORE the
+# 0.5 threshold. Regularizes the silhouette boundary at sub-voxel precision:
+# kills the wiggles and small reflection artifacts that per-mask edge noise
+# leaves after voting, without eroding the true outline (a blurred step
+# edge still crosses 0.5 at the same place). 0 = off; ~2 is plenty.
+SIL_SMOOTH        = float(os.environ.get('SIL_SMOOTH', '0'))
+# gaussian sigma (voxels) applied to the 3D occupancy volume before marching
+# cubes. On a hard 0/1 volume the iso-surface can only sit on voxel-cube
+# boundaries, which leaves shallow terraces ("onion rings") that mesh
+# smoothing never fully erases; a blurred volume lets the 0.5 iso-surface
+# pass BETWEEN voxels, so the mesh comes out terrace-free at the source.
+# 0 = off; ~1.5 is plenty (the blur support stays inside ~2 voxels ≈ the
+# carve's own resolution, so no real detail is lost).
+VOLUME_SMOOTH     = float(os.environ.get('VOLUME_SMOOTH', '0'))
 MIN_MASK_AREA_PX  = 100
 # quality-first: no decimation by default — set TARGET_FACES to cap triangle
 # count only when a delivery target (e.g. web/AR) demands it
@@ -161,7 +184,10 @@ def load_view_silhouette(view, rows, cols):
         used += 1
     if used == 0:
         return None
-    sil = acc / used >= VOTE_FRACTION
+    prob = acc / used
+    if SIL_SMOOTH > 0:
+        prob = cv2.GaussianBlur(prob, (0, 0), SIL_SMOOTH)
+    sil = prob >= VOTE_FRACTION
     # small open+close pass kills speckles / hairline leaks without moving edges
     k = max(3, RESOLUTION // 86) | 1
     kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k, k))
@@ -203,32 +229,63 @@ def orient_to_grid(sil, view):
     raise ValueError(view)
 
 
+def _smooth_rows(vals, sigma):
+    """Gaussian-smooth a per-row profile in place of its valid (non-NaN)
+    rows. Row spacing is preserved by smoothing only the valid run — empty
+    rows (outside the object) stay empty."""
+    ok = ~np.isnan(vals)
+    if sigma <= 0 or ok.sum() < 3:
+        return vals
+    from scipy.ndimage import gaussian_filter1d
+    out = vals.copy()
+    out[ok] = gaussian_filter1d(vals[ok], sigma, mode='nearest')
+    return out
+
+
 def lathe_constraint(grid_shape, faces):
     """CROSS_SECTION=round: per height, an elliptical disc whose semi-axes are
     that height's front half-width and side half-depth. Equivalent to carving
     with a continuum of views rotated about the vertical axis — removes the
     diagonal bulges the four perpendicular views can't see. Row centers come
     from each row's own extent, so an off-axis profile (spout, lean) follows
-    the silhouette rather than snapping to the grid center."""
+    the silhouette rather than snapping to the grid center.
+
+    With PROFILE_SMOOTH > 0 the per-row centers/radii are gaussian-smoothed
+    along the height axis before carving — mask-edge noise otherwise jitters
+    each row independently and leaves horizontal rings on the surface."""
     nx, ny, nz = grid_shape
     occ = np.zeros(grid_shape, dtype=bool)
     xs, zs = np.arange(nx), np.arange(nz)
     side = faces['side'] if 'side' in faces else None       # [iz, iy]
+
+    prof = {k: np.full(ny, np.nan) for k in ('cx', 'rx', 'cz', 'rz')}
     for iy in range(ny):
         span_x = np.flatnonzero(faces['front'][:, iy])
         if span_x.size == 0:
             continue
-        cx = (span_x[0] + span_x[-1]) / 2
-        rx = max((span_x[-1] - span_x[0]) / 2, 0.5)
+        prof['cx'][iy] = (span_x[0] + span_x[-1]) / 2
+        prof['rx'][iy] = max((span_x[-1] - span_x[0]) / 2, 0.5)
         if side is not None:
             span_z = np.flatnonzero(side[:, iy])
             if span_z.size == 0:
+                prof['cx'][iy] = prof['rx'][iy] = np.nan
                 continue
-            cz = (span_z[0] + span_z[-1]) / 2
-            rz = max((span_z[-1] - span_z[0]) / 2, 0.5)
+            prof['cz'][iy] = (span_z[0] + span_z[-1]) / 2
+            prof['rz'][iy] = max((span_z[-1] - span_z[0]) / 2, 0.5)
         else:
             # no side view: assume a circular section centered in depth
-            cz, rz = (nz - 1) / 2, rx
+            prof['cz'][iy] = (nz - 1) / 2
+            prof['rz'][iy] = prof['rx'][iy]
+
+    if PROFILE_SMOOTH > 0:
+        prof = {k: _smooth_rows(v, PROFILE_SMOOTH) for k, v in prof.items()}
+        print(f"    lathe profile smoothed (sigma {PROFILE_SMOOTH:g} rows)")
+
+    for iy in range(ny):
+        if np.isnan(prof['cx'][iy]) or np.isnan(prof['cz'][iy]):
+            continue
+        cx, rx = prof['cx'][iy], prof['rx'][iy]
+        cz, rz = prof['cz'][iy], prof['rz'][iy]
         occ[:, iy, :] = (((xs - cx) / rx) ** 2)[:, None] \
                       + (((zs - cz) / rz) ** 2)[None, :] <= 1.0
     return occ
@@ -256,8 +313,16 @@ def carve(grid_shape, faces):
 # ---------------------------------------------------------------- meshing
 
 def voxels_to_mesh(occ, voxel_size_m):
-    # zero-padding closes the surface at grid boundaries
-    vol = np.pad(occ.astype(np.float32), 1)
+    # zero-padding closes the surface at grid boundaries; when the volume is
+    # blurred the pad must cover the blur support, or the smoothed surface
+    # gets clipped by the array edge and the mesh comes out open (not
+    # watertight)
+    pad = max(1, int(np.ceil(3 * VOLUME_SMOOTH)) + 1)
+    vol = np.pad(occ.astype(np.float32), pad)
+    if VOLUME_SMOOTH > 0:
+        from scipy.ndimage import gaussian_filter
+        vol = gaussian_filter(vol, VOLUME_SMOOTH)
+        print(f"    occupancy volume smoothed (sigma {VOLUME_SMOOTH:g} voxels)")
     verts, faces, _, _ = measure.marching_cubes(vol, level=0.5, spacing=voxel_size_m)
     mesh = trimesh.Trimesh(vertices=verts, faces=faces, process=True)
     # taubin smoothing removes the voxel staircase with far less shrinkage
@@ -311,6 +376,10 @@ def embed_provenance(glb_path, dims_cm, stage2_meta, views_used, grid_shape):
         'side_captured_from': SIDE_FROM if 'side' in views_used else None,
         'holes_filled_views': sorted(FILL_HOLES_VIEWS & set(views_used)),
         'cross_section':      CROSS_SECTION,
+        'smooth_iterations':  SMOOTH_ITERATIONS,
+        'profile_smooth':     PROFILE_SMOOTH,
+        'sil_smooth':         SIL_SMOOTH,
+        'volume_smooth':      VOLUME_SMOOTH,
         'voxel_grid':         list(grid_shape),
         'stage2_model_versions': stage2_meta.get('model_versions'),
     }

@@ -8,7 +8,10 @@ instance_segmentation_step/output/
 depth_estimation_step/__pycache__/
 depth_estimation_step/output/
 measurement_extraction_step/__pycache__/
-measurement_extraction_step/output/
+# ignore outputs but keep the measurements JSONs tracked — Stage 3 depends
+# on them and clean-outputs once wiped the only copy
+measurement_extraction_step/output/*
+!measurement_extraction_step/output/measurements_*.json
 .DS_Store
 accuracy_validation_step/__pycache__/
 accuracy_validation_step/output/
@@ -23,3 +26,6 @@ asset_generation_step/raw_models/
 # model weights (auto-downloaded)
 *.pt
 *.ts
+
+# generated reports (rebuilt by the sweep scripts)
+asset_generation_step/*.pdf

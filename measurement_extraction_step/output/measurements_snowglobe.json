@@ -1,0 +1,18 @@
+{
+  "subject_id": "snowglobe",
+  "measurements_cm": {
+    "width": 10.4,
+    "height": 13.7,
+    "depth": 10.2
+  },
+  "error_estimates_cm": {
+    "width": 0.05,
+    "height": 0.06,
+    "depth": 0.04
+  },
+  "model_versions": {
+    "segmentation": "grounding-dino-base + sam2.1_b",
+    "depth_estimation": "Depth-Anything-V2-Small"
+  },
+  "notes": "Recovered 2026-07-13 from work/snowglobe_hull.glb provenance extras after a make clean wiped measurement_extraction_step/output/. Values are the original Stage 2 measurements; height_cross_check and per-frame stats were not recoverable."
+}

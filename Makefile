@@ -58,6 +58,11 @@ color-asset:
 	@echo "painting vertex colors from capture photos (Stage 3, M2)..."
 	@$(PYTHON) asset_generation_step/color_hull.py
 
+test-asset:
+	@echo "testing the generated asset"
+	@echo "use case: SUBJECT=object_name FACE_BUDGETS=####,####,#### make test-asset"
+	@$(PYTHON) asset_generation_step/fidelity_sweep.py
+
 most-pipeline: instance-segmentation depth-estimation measurement-extraction merge-views
 	@echo "running the majority of the pipeline"
 
@@ -71,6 +76,10 @@ clean-images:
 clean-frames:
 	@echo "cleaning frames directory..."
 	@rm -rf instance_segmentation_step/frames/*
+
+clean-assets:
+	@echo "cleaning assets directory..."
+	@rm -rf asset_generation_step/work/lods/*
 
 clean-some-outputs:
 	@echo "cleaning some output directories..."
