@@ -18,7 +18,7 @@ not depth/measurement, since scale comes entirely from the measurements JSON.
 
 Usage:  SUBJECT=snowglobe CROSS_SECTION=round make build-asset
         SUBJECT=snowglobe RESOLUTION=768 SIDE_FROM=left FILL_HOLES=all \
-            venv/bin/python asset_generation_step/build_silhouette_mesh.py
+            venv/bin/python asset_generation_step/pipeline/build_silhouette_mesh.py
 
 Output: work/<SUBJECT>_hull.glb  — metres, +Y up, front facing +Z,
         origin at bottom-center, provenance embedded in glTF extras.
@@ -36,7 +36,7 @@ import trimesh
 from pygltflib import GLTF2
 from skimage import measure
 
-BASE_DIR   = os.path.dirname(os.path.abspath(__file__))
+BASE_DIR   = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))  # asset_generation_step/
 SUBJECT_ID = os.environ.get('SUBJECT', 'product_000')
 RESOLUTION = int(os.environ.get('RESOLUTION', '512'))   # voxels along the longest axis
 # Which side of the product the 'side' set was shot from. Getting this wrong
@@ -368,7 +368,7 @@ def embed_provenance(glb_path, dims_cm, stage2_meta, views_used, grid_shape):
     g.scenes[g.scene or 0].extras = {
         'subject_id':         SUBJECT_ID,
         'route':              'silhouette_hull',
-        'generator':          'asset_generation_step/build_silhouette_mesh.py',
+        'generator':          'asset_generation_step/pipeline/build_silhouette_mesh.py',
         'generated_at':       datetime.now().isoformat(),
         'measurements_cm':    dims_cm,
         'error_estimates_cm': stage2_meta.get('error_estimates_cm'),

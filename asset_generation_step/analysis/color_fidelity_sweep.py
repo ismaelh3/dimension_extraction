@@ -18,7 +18,7 @@ Requires: work/<SUBJECT>_hull_colored.glb (the reference, from color_hull.py),
 work/lods/<SUBJECT>_lod_<budget>.glb (from fidelity_sweep.py — re-decimated
 from the hull if missing), frames + masks + calibration as for color_hull.py.
 
-Usage:  SUBJECT=snowglobe venv/bin/python asset_generation_step/color_fidelity_sweep.py
+Usage:  SUBJECT=snowglobe venv/bin/python asset_generation_step/analysis/color_fidelity_sweep.py
 
 Output: work/lods/<SUBJECT>_lod_<faces>_colored.glb
         work/lods/render_color_*.png               same-camera colored renders
@@ -35,8 +35,9 @@ import numpy as np
 import trimesh
 from scipy.spatial import KDTree
 
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-sys.path.insert(0, BASE_DIR)
+BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))  # asset_generation_step/
+sys.path.insert(0, os.path.join(BASE_DIR, 'pipeline'))
+sys.path.insert(0, os.path.join(BASE_DIR, 'analysis'))
 import color_hull                                    # noqa: E402
 from fidelity_sweep import decimate, render          # noqa: E402
 

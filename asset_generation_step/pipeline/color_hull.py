@@ -18,7 +18,7 @@ automatically (orthographic sampling ignores the depth axis).
 
 Usage:  SUBJECT=snowglobe make color-asset
         FRAMES_DIR=path/to/frames SUBJECT=x venv/bin/python \
-            asset_generation_step/color_hull.py
+            asset_generation_step/pipeline/color_hull.py
 
 Output: work/<SUBJECT>_hull_colored.glb — geometry untouched, provenance
         extras carried over from the input hull plus a color_pass block.
@@ -35,7 +35,7 @@ import numpy as np
 import trimesh
 from pygltflib import GLTF2
 
-BASE_DIR   = os.path.dirname(os.path.abspath(__file__))
+BASE_DIR   = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))  # asset_generation_step/
 SUBJECT_ID = os.environ.get('SUBJECT', 'product_000')
 SIDE_FROM  = os.environ.get('SIDE_FROM', 'right')
 FRAMES_DIR = os.environ.get('FRAMES_DIR', os.path.join(

@@ -7,6 +7,25 @@
 
 ---
 
+## Folder layout
+
+```
+pipeline/   the asset chain, run in order per product:
+            build_silhouette_mesh.py  -> work/<id>_hull.glb        (master, uncapped)
+            texture_hull.py           -> work/<id>_textured.glb    (20k faces + baked UV atlas)
+            material_pass.py          -> work/<id>_final.glb       (glass/base PBR split)
+            color_hull.py             -> work/<id>_hull_colored.glb (M2 v1 vertex colors, legacy)
+analysis/   quality experiments: fidelity_sweep.py (geometry-vs-budget),
+            color_fidelity_sweep.py (color-vs-budget); both write work/lods/
+tools/      preview_render.py — z-buffered software renderer for honest previews
+            (matplotlib 3D has no depth buffer and draws fake surface artifacts)
+masks/      input: curated segmentation masks per subject/view
+work/       output: generated assets (work/lods/ is disposable — make clean-assets)
+```
+
+Make targets: `build-asset`, `texture-asset`, `material-asset`, `color-asset`,
+`test-asset`, `clean-assets` — all take `SUBJECT=<id>` plus each script's env knobs.
+
 ## Goal
 
 Turn each measured product into a 3D mesh whose bounding box matches the Stage 2

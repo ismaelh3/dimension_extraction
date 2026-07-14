@@ -23,7 +23,7 @@ Knobs:  GLASS_ROUGHNESS (default 0.08)   BASE_ROUGHNESS (default 0.9)
             viewers that support it, but it makes the baked interior
             scene fade toward a tint; try 0.2-0.4)
 
-Usage:  SUBJECT=snowglobe venv/bin/python asset_generation_step/material_pass.py
+Usage:  SUBJECT=snowglobe venv/bin/python asset_generation_step/pipeline/material_pass.py
 
 Input:  work/<SUBJECT>_textured.glb   (from texture_hull.py)
 Output: work/<SUBJECT>_final.glb      (+ _split_debug.png showing the split)
@@ -36,8 +36,8 @@ import numpy as np
 import trimesh
 from pygltflib import GLTF2
 
-BASE_DIR   = os.path.dirname(os.path.abspath(__file__))
-sys.path.insert(0, BASE_DIR)
+BASE_DIR   = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))  # asset_generation_step/
+sys.path.insert(0, os.path.join(BASE_DIR, 'tools'))
 from preview_render import raster_preview  # noqa: E402
 
 SUBJECT_ID = os.environ.get('SUBJECT', 'product_000')

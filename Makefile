@@ -52,16 +52,24 @@ accuracy-validation:
 
 build-asset:
 	@echo "building silhouette-hull mesh (Stage 3)..."
-	@$(PYTHON) asset_generation_step/build_silhouette_mesh.py
+	@$(PYTHON) asset_generation_step/pipeline/build_silhouette_mesh.py
 
 color-asset:
 	@echo "painting vertex colors from capture photos (Stage 3, M2)..."
-	@$(PYTHON) asset_generation_step/color_hull.py
+	@$(PYTHON) asset_generation_step/pipeline/color_hull.py
+
+texture-asset:
+	@echo "baking UV texture from capture photos (Stage 3, M2 v2)..."
+	@$(PYTHON) asset_generation_step/pipeline/texture_hull.py
+
+material-asset:
+	@echo "splitting PBR materials on the textured asset (Stage 3, M2 v3)..."
+	@$(PYTHON) asset_generation_step/pipeline/material_pass.py
 
 test-asset:
 	@echo "testing the generated asset"
 	@echo "use case: SUBJECT=object_name FACE_BUDGETS=####,####,#### make test-asset"
-	@$(PYTHON) asset_generation_step/fidelity_sweep.py
+	@$(PYTHON) asset_generation_step/analysis/fidelity_sweep.py
 
 most-pipeline: instance-segmentation depth-estimation measurement-extraction merge-views
 	@echo "running the majority of the pipeline"

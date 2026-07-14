@@ -12,7 +12,7 @@ vertex colors.
 Inputs match color_hull.py (masks/, frames/, calibration) plus the hull
 master work/<SUBJECT>_hull.glb.
 
-Usage:  SUBJECT=snowglobe venv/bin/python asset_generation_step/texture_hull.py
+Usage:  SUBJECT=snowglobe venv/bin/python asset_generation_step/pipeline/texture_hull.py
         knobs: TARGET_FACES (default 20000), TEXTURE_SIZE (default 2048),
                plus color_hull's SIDE_FROM / FRAMES_DIR / BLEND_POWER
 
@@ -30,8 +30,9 @@ import xatlas
 from PIL import Image
 from pygltflib import GLTF2
 
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-sys.path.insert(0, BASE_DIR)
+BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))  # asset_generation_step/
+sys.path.insert(0, os.path.join(BASE_DIR, 'pipeline'))
+sys.path.insert(0, os.path.join(BASE_DIR, 'analysis'))
 import color_hull                          # noqa: E402
 from fidelity_sweep import decimate        # noqa: E402
 

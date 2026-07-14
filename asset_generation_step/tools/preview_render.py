@@ -18,7 +18,7 @@ Usage (module):
     img = raster_preview(mesh, uv=uv, texture=pil)   # textured
 
 Usage (CLI):
-    venv/bin/python asset_generation_step/preview_render.py in.glb out.png
+    venv/bin/python asset_generation_step/tools/preview_render.py in.glb out.png
 """
 
 import numpy as np

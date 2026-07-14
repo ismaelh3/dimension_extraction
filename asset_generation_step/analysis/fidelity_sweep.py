@@ -17,7 +17,7 @@ Error metric: symmetric chamfer distance between dense surface samplings of
 the reference and each level (mean + p95, reported in mm). No rtree needed —
 plain KD-trees on sampled point clouds.
 
-Usage:  SUBJECT=snowglobe venv/bin/python asset_generation_step/fidelity_sweep.py
+Usage:  SUBJECT=snowglobe venv/bin/python asset_generation_step/analysis/fidelity_sweep.py
 
 Output: work/lods/<SUBJECT>_lod_<faces>.glb        one asset per level
         work/lods/render_*.png                     same-camera renders
@@ -32,7 +32,7 @@ import numpy as np
 import trimesh
 from scipy.spatial import KDTree
 
-BASE_DIR    = os.path.dirname(os.path.abspath(__file__))
+BASE_DIR    = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))  # asset_generation_step/
 SUBJECT_ID  = os.environ.get('SUBJECT', 'product_000')
 HULL_GLB    = os.path.join(BASE_DIR, 'work', f'{SUBJECT_ID}_hull.glb')
 OUT_DIR     = os.path.join(BASE_DIR, 'work', 'lods')
