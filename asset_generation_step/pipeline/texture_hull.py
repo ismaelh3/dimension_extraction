@@ -44,13 +44,14 @@ OUT_GLB      = os.path.join(BASE_DIR, 'work', f'{SUBJECT_ID}_textured.glb')
 DEBUG_PNG    = os.path.join(BASE_DIR, 'work', f'{SUBJECT_ID}_texture_debug.png')
 
 
-def blend_points(X, Y, Z, normals, cam, dist, calib_wh):
+def blend_points(X, Y, Z, normals, cam, dist, calib_wh, extents=None):
     """color_hull's sample-and-blend, for arbitrary surface points (the
     vertex pass runs this on vertices; the bake runs it on texel centers)."""
     colors, weights = {}, {}
     nx, ny, nz = normals.T
     for view in color_hull.VIEWS:
-        col = color_hull.sample_view(view, X, Y, Z, cam, dist, calib_wh)
+        col = color_hull.sample_view(view, X, Y, Z, cam, dist, calib_wh,
+                                     extents=extents)
         if col is None:
             continue
         colors[view] = col
@@ -71,9 +72,17 @@ def blend_points(X, Y, Z, normals, cam, dist, calib_wh):
         print("[!] Front view is required for the texture bake.")
         sys.exit(1)
     total = sum(weights.values())
-    total[total == 0] = 1
+    # DEPTH_CARVE cavities can expose a texel whose normal isn't favorably
+    # aligned with ANY of the 4 orthogonal capture directions (e.g. a floor
+    # patch occluded from every shot by the collar rim above it) — total=0
+    # there. Report which: the caller must NOT mark these "filled", or the
+    # forced blend=0 bakes a black hole (found on a shoe's mouth floor) that
+    # dilate_texture's neighbor-flood never gets a chance to fix, since it
+    # only patches texels outside the UV islands, not degenerate ones inside.
+    has_data = total > 0
+    total[~has_data] = 1
     blend = sum(colors[v] * (weights[v] / total)[:, None] for v in colors)
-    return np.clip(blend, 0, 255), sorted(colors)
+    return np.clip(blend, 0, 255), sorted(colors), has_data
 
 
 def rasterize_uv(faces, uvs, tsize):
@@ -122,8 +131,20 @@ def main():
     hull = trimesh.load(HULL_GLB, force='mesh')
     src_extras = GLTF2().load(HULL_GLB).scenes[0].extras or {}
     print(f"[*] Decimating {len(hull.faces):,} -> {TARGET_FACES:,} faces...")
+    was_watertight = hull.is_watertight
     mesh = decimate(hull, TARGET_FACES)
+    # A 100x quadric-decimation pass can lose manifoldness on thin,
+    # high-curvature features it collapses too aggressively — seen in
+    # practice on a DEPTH_CARVE cavity wall (one side of a shoe's mouth came
+    # out with a hole after decimation, though the un-decimated hull was
+    # watertight). fill_holes patches the small gaps decimation introduces;
+    # it's a no-op when there's nothing to patch.
+    if was_watertight and not mesh.is_watertight:
+        mesh.fill_holes()
     mesh.fix_normals()
+    if was_watertight and not mesh.is_watertight:
+        print(f"    [!] decimation broke watertightness and fill_holes "
+              f"couldn't fully repair it — inspect the bake for gaps")
 
     print("[*] UV-unwrapping with xatlas...")
     vmapping, indices, uvs = xatlas.parametrize(mesh.vertices, mesh.faces)
@@ -146,14 +167,19 @@ def main():
 
     print("[*] Projecting texels onto the capture photos...")
     cam, dist, calib_wh = color_hull.load_calibration(color_hull.CALIB_FILE)
-    colors, views_used = blend_points(X, Y, Z, nrm, cam, dist, calib_wh)
+    colors, views_used, has_data = blend_points(X, Y, Z, nrm, cam, dist, calib_wh,
+                                                extents=hi - lo)
+    if (~has_data).any():
+        print(f"    [!] {(~has_data).sum():,} texel(s) not favorably seen by "
+              f"any view (likely a DEPTH_CARVE cavity wall) — filled from "
+              f"nearest neighbor instead of baking them black")
 
     tex = np.zeros((TEXTURE_SIZE, TEXTURE_SIZE, 3), np.uint8)
     filled = np.zeros((TEXTURE_SIZE, TEXTURE_SIZE), bool)
     # v axis: glTF UV origin is top-left, xatlas uvs are in [0,1] with v up
     row = (TEXTURE_SIZE - 1) - ty
     tex[row, tx] = colors.astype(np.uint8)
-    filled[row, tx] = True
+    filled[row, tx] = has_data
     print("[*] Dilating island borders...")
     tex = dilate_texture(tex, filled)
     Image.fromarray(tex).save(DEBUG_PNG)

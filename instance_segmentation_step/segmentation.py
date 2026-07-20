@@ -27,7 +27,7 @@ SAM2_MODEL = os.path.join(SCRIPT_DIR, 'sam2.1_b.pt')   # downloads automatically
 # Change this per product you measure. (The model expects lowercase text ending
 # in a period; normalise_prompt() applies that automatically.)
 # Defaul Placeholder: 'INSERT_PRODUCT_NAME.'
-PRODUCT_PROMPT = 'red and green baseball cap.'
+PRODUCT_PROMPT = 'white sneaker.'
 
 # Detection thresholds. BOX: minimum confidence for a detection to count at all.
 # TEXT: how strongly the detection must match the words of the prompt.

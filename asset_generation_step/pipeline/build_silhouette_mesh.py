@@ -9,7 +9,10 @@ segmentation masks. Supports any subset of four views:
 
 Note: top and bottom produce the SAME carving constraint (an object's silhouette
 along the vertical axis is identical from above and below, mirrored) — one of the
-two is enough for geometry; providing both just makes that silhouette more robust.
+two is enough for geometry. When both are provided they are UNIONED into a single
+footprint before carving: camera tilt skews each one slightly, and intersecting
+two skewed footprints carves off whatever they disagree about (it cost the
+sneaker 14 mm of toe). Union keeps anything either view saw.
 
 Masks are consumed from  masks/<SUBJECT>/<view>/*.png  (the 0/255 PNGs the
 segmentation step writes). Copy each capture set's masks there after running
@@ -27,6 +30,7 @@ Output: work/<SUBJECT>_hull.glb  — metres, +Y up, front facing +Z,
 import glob
 import json
 import os
+import pickle
 import sys
 from datetime import datetime
 
@@ -56,7 +60,47 @@ FILL_HOLES = os.environ.get('FILL_HOLES', 'top,bottom')
 # the ellipse spanned by that height's front half-width and side half-depth.
 # Keep 'silhouette' (default) for box-like/asymmetric products — 'round'
 # would shave their corners off.
+# 'footprint' is the middle ground for products with a rounded but
+# non-elliptical outline (shoes): it sweeps the top-view footprint along the
+# height axis, rescaled per row to the front/side spans, so the ends taper
+# with the height profile instead of being extruded as boxy walls — without
+# the lathe forcing an ellipse onto them. Requires top and/or bottom masks.
 CROSS_SECTION = os.environ.get('CROSS_SECTION', 'silhouette')
+# Silhouettes provably cannot carve a concavity — the rim of an opening (a
+# shoe's mouth, a cap's bowl) hides the interior from every outline, so the
+# hull shrink-wraps a flat lid across it. DEPTH_CARVE re-opens it using
+# monocular depth from the one view that looks INTO the cavity: per frame,
+# disparity is converted to real height above the table via two anchors (the
+# table itself, and the shell's own closest points, both solved exactly, see
+# _height_m), a sink-fill test finds pixels enclosed deep enough to be a true
+# pocket rather than an honest slope, and voxels above that floor get
+# cleared. Needs per-frame disparity .npy files from tools/probe_opening_depth
+# .py in work/depth_probe/<SUBJECT>/. Opt-in per subject ('top', 'bottom', or
+# 'top,bottom'): matte interiors (fabric, foam) read well; glass/gloss breaks
+# monocular depth — leave those subjects off.
+DEPTH_CARVE = os.environ.get('DEPTH_CARVE', 'none')
+# Monocular relative depth is an ORDINAL signal, not a metric one: it gets
+# the SHAPE of the cavity right (where it's deeper vs shallower) but
+# compresses the absolute magnitude in a dim, low-texture interior — a real
+# limitation of the model, not a calibration bug (verified: even with both
+# anchors solved exactly, the sneaker's mouth measured 5.2cm max against a
+# 7.9cm tape measurement). DEPTH_CARVE_GAIN scales the carved depth (about
+# each column's own lid height, so shape is preserved) to match a real
+# measurement: gain = true_depth_cm / reported_depth_cm from the previous
+# run's "cavity ... depth ... max" line. 1.0 = no correction.
+DEPTH_CARVE_GAIN = float(os.environ.get('DEPTH_CARVE_GAIN', '1.0'))
+# Top/bottom photos are easy to shoot 90° off convention (product's long axis
+# along image rows instead of columns) — load_view_silhouette detects this by
+# aspect ratio and auto-rotates the mask. Aspect alone can't distinguish the
+# two possible 90° rotations, so this says which side of the as-shot image
+# faces the product's FRONT (the face the front view shows): 'left' or
+# 'right', either one value for both views or per-view as
+# 'top:left,bottom:right'. Only consulted when a rotation is actually
+# applied. The default matches the nike-shoe captures (verified against the
+# collar position in the top view and the forefoot bulge in the sole view):
+# both sets were shot toe-at-image-top, and orient_to_grid's roll-mirror for
+# the bottom view means the two then need OPPOSITE rotations.
+TOPDOWN_FRONT = os.environ.get('TOPDOWN_FRONT', 'top:left,bottom:right')
 
 VOTE_FRACTION     = 0.5   # pixel kept if inside >= this fraction of a view's masks
 # taubin iterations: 10 leaves faint voxel-staircase ridges visible on smooth
@@ -104,10 +148,31 @@ if _unknown:
     print(f"[!] FILL_HOLES names unknown view(s) {sorted(_unknown)} — "
           f"valid: {', '.join(VIEWS)}, or all/none.")
     sys.exit(1)
-if CROSS_SECTION not in ('silhouette', 'round'):
-    print(f"[!] CROSS_SECTION must be 'silhouette' or 'round', "
+if CROSS_SECTION not in ('silhouette', 'round', 'footprint'):
+    print(f"[!] CROSS_SECTION must be 'silhouette', 'round', or 'footprint', "
           f"not '{CROSS_SECTION}'.")
     sys.exit(1)
+_dc = DEPTH_CARVE.strip().lower()
+DEPTH_CARVE_VIEWS = set() if _dc in ('', 'none') else {v.strip() for v in _dc.split(',')}
+if DEPTH_CARVE_VIEWS - {'top', 'bottom'}:
+    print(f"[!] DEPTH_CARVE only supports top/bottom (the views that look into "
+          f"an opening) — got '{DEPTH_CARVE}'.")
+    sys.exit(1)
+def _parse_topdown_front(spec):
+    spec = spec.strip().lower()
+    if spec in ('left', 'right'):
+        return {'top': spec, 'bottom': spec}
+    sides = {}
+    for part in spec.split(','):
+        view, _, side = part.strip().partition(':')
+        if view not in ('top', 'bottom') or side not in ('left', 'right'):
+            print(f"[!] TOPDOWN_FRONT must be 'left', 'right', or per-view like "
+                  f"'top:left,bottom:right' — got '{spec}'.")
+            sys.exit(1)
+        sides[view] = side
+    return {'top': sides.get('top', 'left'), 'bottom': sides.get('bottom', 'left')}
+
+TOPDOWN_FRONT_SIDES = _parse_topdown_front(TOPDOWN_FRONT)
 
 
 # ---------------------------------------------------------------- inputs
@@ -154,6 +219,39 @@ def fill_holes(mask_bool):
     return filled.astype(bool)
 
 
+def _topdown_rotation_k(shape_hw, view, rows, cols, name):
+    """Rotation (in np.rot90 quarter-turns) that fixes a top/bottom capture
+    shot 90° off convention — split out so the depth loader can apply the
+    SAME decision to a frame's disparity map as to its mask."""
+    if min(rows, cols) / max(rows, cols) > 0.8:
+        return 0                      # near-square face: aspect is ambiguous
+    h, w = shape_hw
+    err_asis    = abs(np.log((w / h) / (cols / rows)))
+    err_rotated = abs(np.log((h / w) / (cols / rows)))
+    if err_rotated >= err_asis:
+        return 0
+    side = TOPDOWN_FRONT_SIDES[view]
+    k = 1 if side == 'left' else 3
+    print(f"    [!] {view} mask {name}: aspect {w / h:.2f} matches the "
+          f"transposed face (expected {cols / rows:.2f}) — rotated 90° "
+          f"{'ccw' if k == 1 else 'cw'} (TOPDOWN_FRONT {view}:{side}). "
+          f"Future captures: long axis along image columns, front at bottom.")
+    return k
+
+
+def fix_topdown_rotation(cropped, view, rows, cols, name):
+    """Catch top/bottom masks shot 90° off convention. The resize in
+    load_view_silhouette stretches whatever it gets onto the face, so a
+    transposed mask doesn't fail — it silently garbles the footprint (this
+    cost the sneaker its toe and heel). If the tight bbox's aspect matches
+    the transposed face better than the expected one, rotate the mask 90°:
+    ccw puts the image's left side at the bottom (= product front, per the
+    top-view convention), cw puts the right side there — TOPDOWN_FRONT picks
+    which, since aspect alone can't."""
+    k = _topdown_rotation_k(cropped.shape, view, rows, cols, name)
+    return np.rot90(cropped, k) if k else cropped
+
+
 def load_view_silhouette(view, rows, cols):
     """Combine every mask PNG for a view into one (rows, cols) silhouette.
 
@@ -179,6 +277,9 @@ def load_view_silhouette(view, rows, cols):
         if cropped is None:
             print(f"    [!] empty mask skipped: {os.path.basename(p)}")
             continue
+        if view in ('top', 'bottom'):
+            cropped = fix_topdown_rotation(cropped, view, rows, cols,
+                                           os.path.basename(p))
         acc += cv2.resize(cropped.astype(np.float32), (cols, rows),
                           interpolation=cv2.INTER_AREA)
         used += 1
@@ -242,22 +343,19 @@ def _smooth_rows(vals, sigma):
     return out
 
 
-def lathe_constraint(grid_shape, faces):
-    """CROSS_SECTION=round: per height, an elliptical disc whose semi-axes are
-    that height's front half-width and side half-depth. Equivalent to carving
-    with a continuum of views rotated about the vertical axis — removes the
-    diagonal bulges the four perpendicular views can't see. Row centers come
-    from each row's own extent, so an off-axis profile (spout, lean) follows
-    the silhouette rather than snapping to the grid center.
+def _height_profile(grid_shape, faces):
+    """Per-height span centers and half-extents: cx/rx from the front view's
+    x-span, cz/rz from the side view's z-span (NaN where there's no side
+    view, or the row is outside the object). Row centers come from each
+    row's own extent, so an off-axis profile (spout, lean) follows the
+    silhouette rather than snapping to the grid center. Shared by the round
+    and footprint cross-section modes.
 
-    With PROFILE_SMOOTH > 0 the per-row centers/radii are gaussian-smoothed
-    along the height axis before carving — mask-edge noise otherwise jitters
-    each row independently and leaves horizontal rings on the surface."""
+    With PROFILE_SMOOTH > 0 the per-row centers/extents are gaussian-smoothed
+    along the height axis — mask-edge noise otherwise jitters each row
+    independently and leaves horizontal rings on the surface."""
     nx, ny, nz = grid_shape
-    occ = np.zeros(grid_shape, dtype=bool)
-    xs, zs = np.arange(nx), np.arange(nz)
     side = faces['side'] if 'side' in faces else None       # [iz, iy]
-
     prof = {k: np.full(ny, np.nan) for k in ('cx', 'rx', 'cz', 'rz')}
     for iy in range(ny):
         span_x = np.flatnonzero(faces['front'][:, iy])
@@ -272,22 +370,71 @@ def lathe_constraint(grid_shape, faces):
                 continue
             prof['cz'][iy] = (span_z[0] + span_z[-1]) / 2
             prof['rz'][iy] = max((span_z[-1] - span_z[0]) / 2, 0.5)
-        else:
-            # no side view: assume a circular section centered in depth
-            prof['cz'][iy] = (nz - 1) / 2
-            prof['rz'][iy] = prof['rx'][iy]
-
     if PROFILE_SMOOTH > 0:
         prof = {k: _smooth_rows(v, PROFILE_SMOOTH) for k, v in prof.items()}
-        print(f"    lathe profile smoothed (sigma {PROFILE_SMOOTH:g} rows)")
+        print(f"    height profile smoothed (sigma {PROFILE_SMOOTH:g} rows)")
+    return prof
 
+
+def lathe_constraint(grid_shape, faces):
+    """CROSS_SECTION=round: per height, an elliptical disc whose semi-axes are
+    that height's front half-width and side half-depth. Equivalent to carving
+    with a continuum of views rotated about the vertical axis — removes the
+    diagonal bulges the four perpendicular views can't see."""
+    nx, ny, nz = grid_shape
+    occ = np.zeros(grid_shape, dtype=bool)
+    xs, zs = np.arange(nx), np.arange(nz)
+    prof = _height_profile(grid_shape, faces)
     for iy in range(ny):
-        if np.isnan(prof['cx'][iy]) or np.isnan(prof['cz'][iy]):
+        cx, rx, cz, rz = (prof[k][iy] for k in ('cx', 'rx', 'cz', 'rz'))
+        if np.isnan(cx):
             continue
-        cx, rx = prof['cx'][iy], prof['rx'][iy]
-        cz, rz = prof['cz'][iy], prof['rz'][iy]
+        if np.isnan(cz):
+            # no side view: assume a circular section centered in depth
+            cz, rz = (nz - 1) / 2, rx
         occ[:, iy, :] = (((xs - cx) / rx) ** 2)[:, None] \
                       + (((zs - cz) / rz) ** 2)[None, :] <= 1.0
+    return occ
+
+
+def footprint_sweep(grid_shape, faces, footprint):
+    """CROSS_SECTION=footprint: sweep the top-view footprint along the height
+    axis — at each height, the footprint is rescaled and re-centered to fit
+    that row's front x-span and side z-span, and everything outside it is
+    carved.
+
+    The middle ground between the other two modes: 'silhouette' extrudes the
+    footprint at full size through every height, so any tilt-skew
+    disagreement between it and the front view carves flat vertical faces at
+    the ends; 'round' fixes that by replacing the section with an ellipse,
+    but shaves the ends off anything that isn't lathe-symmetric (a shoe toe).
+    Sweeping keeps the footprint's true outline while letting it taper with
+    the height profile. The sweep is pinned to the front/side spans per row,
+    which also makes the raw footprint AND redundant — carve() skips it in
+    this mode, so footprint-vs-front disagreements can't cut anything."""
+    nx, ny, nz = grid_shape
+    fx = np.flatnonzero(footprint.any(axis=1))
+    fz = np.flatnonzero(footprint.any(axis=0))
+    fcx, frx = (fx[0] + fx[-1]) / 2, max((fx[-1] - fx[0]) / 2, 0.5)
+    fcz, frz = (fz[0] + fz[-1]) / 2, max((fz[-1] - fz[0]) / 2, 0.5)
+    occ = np.zeros(grid_shape, dtype=bool)
+    xs, zs = np.arange(nx), np.arange(nz)
+    prof = _height_profile(grid_shape, faces)
+    for iy in range(ny):
+        cx, rx, cz, rz = (prof[k][iy] for k in ('cx', 'rx', 'cz', 'rz'))
+        if np.isnan(cx):
+            continue
+        if np.isnan(cz):
+            # no side view: keep the footprint's own depth-to-width aspect
+            cz, rz = (nz - 1) / 2, rx * frz / frx
+        # map this row's box onto the footprint's box and sample it
+        u = np.round((xs - cx) / rx * frx + fcx).astype(int)
+        v = np.round((zs - cz) / rz * frz + fcz).astype(int)
+        ok_u = (u >= 0) & (u < nx)
+        ok_v = (v >= 0) & (v < nz)
+        sect = np.zeros((nx, nz), dtype=bool)
+        sect[np.ix_(ok_u, ok_v)] = footprint[np.ix_(u[ok_u], v[ok_v])]
+        occ[:, iy, :] = sect
     return occ
 
 
@@ -300,14 +447,287 @@ def carve(grid_shape, faces):
         occ &= faces['back'][:, :, None]
     if 'side' in faces:
         occ &= faces['side'].T[None, :, :]          # [iz, iy] -> [1, iy, iz]
-    if 'top' in faces:
-        occ &= faces['top'][:, None, :]             # [ix, iz] -> broadcast over Y
-    if 'bottom' in faces:
-        occ &= faces['bottom'][:, None, :]
+    # top and bottom describe the SAME footprint, but each is skewed a little
+    # by camera tilt (and by genuinely different outlines: collar/laces from
+    # above vs sole from below). AND-ing them as independent constraints lets
+    # any disagreement carve real geometry — on the sneaker the two footprints
+    # shared zero depth-rows at the toe/heel columns and chopped 14/11 mm off
+    # the ends as flat vertical faces. Union them into ONE footprint first, so
+    # a region survives if either view saw it; redundancy then adds coverage
+    # instead of subtracting it.
+    footprint = None
+    for v in ('top', 'bottom'):
+        if v in faces:
+            footprint = faces[v] if footprint is None else (footprint | faces[v])
+    if 'top' in faces and 'bottom' in faces:
+        # low agreement means one set is oriented differently from the other
+        # (e.g. TOPDOWN_FRONT wrong for one of them) or badly tilt-skewed
+        iou = (faces['top'] & faces['bottom']).sum() / footprint.sum()
+        print(f"    top/bottom footprint agreement (IoU): {iou:.2f}")
+    if CROSS_SECTION == 'footprint':
+        if footprint is None:
+            print("[!] CROSS_SECTION=footprint needs top and/or bottom masks —")
+            print("    none found. Use 'silhouette' or 'round' instead.")
+            sys.exit(1)
+        occ &= footprint_sweep(grid_shape, faces, footprint)
+        print("    swept-footprint cross-section applied")
+    elif footprint is not None:
+        occ &= footprint[:, None, :]                # [ix, iz] -> broadcast over Y
     if CROSS_SECTION == 'round':
         occ &= lathe_constraint(grid_shape, faces)
         print("    round cross-section (lathe) applied")
     return occ
+
+
+# ---------------------------------------------------------------- depth carve
+
+CALIB_FILE = os.path.join(BASE_DIR, '..', 'camera_calibration_step',
+                          'output', 'calibration_data.pkl')
+
+
+def _load_calibration():
+    """(fx, fy, calib_size_wh) from Step 1's pickle, or None if missing."""
+    if not os.path.exists(CALIB_FILE):
+        return None
+    with open(CALIB_FILE, 'rb') as f:
+        d = pickle.load(f)
+    cm = np.asarray(d['camera_matrix'])
+    return float(cm[0, 0]), float(cm[1, 1]), d.get('image_size_wh')
+
+
+def load_view_depthfields(view, rows, cols, dims_cm, calib):
+    """Per-frame (disparity, mask, d_table, H_cam) tuples on the view's face
+    grid, put through the SAME transform chain as the silhouettes (fill ->
+    crop -> rotation -> resize -> orient) so pixel (ix, iz) means the same
+    place in both.
+
+    Frames stay separate on purpose: monocular disparity has an unknown
+    scale AND shift per image, so frames only become comparable after each
+    one is anchored to real units (depth_carve does that) — averaging raw
+    disparities across frames would mix incompatible scales. Masks are
+    always hole-filled here: SAM speckles on cavity interiors (dark insoles)
+    would drop exactly the pixels the carve exists to use."""
+    fx, fy, calib_wh = calib if calib else (None, None, None)
+    fields = []
+    for mp in sorted(glob.glob(os.path.join(MASKS_DIR, view, '*_product_mask.png'))):
+        name = os.path.basename(mp).replace('_product_mask.png', '')
+        dp = os.path.join(WORK_DIR, 'depth_probe', SUBJECT_ID, f'{name}_disparity.npy')
+        if not os.path.exists(dp):
+            print(f"    [!] {view} {name}: no disparity map — run "
+                  f"tools/probe_opening_depth.py (SUBJECT={SUBJECT_ID} "
+                  f"VIEW={view}) first; frame skipped")
+            continue
+        img = cv2.imread(mp, cv2.IMREAD_GRAYSCALE)
+        if img is None:
+            continue
+        mask = fill_holes(img > 127)
+        pts = cv2.findNonZero(mask.astype(np.uint8))
+        if pts is None or len(pts) < MIN_MASK_AREA_PX:
+            continue
+        x, y, w, h = cv2.boundingRect(pts)
+        disp = np.load(dp).astype(np.float32)
+        if disp.shape != mask.shape:
+            disp = cv2.resize(disp, (mask.shape[1], mask.shape[0]),
+                              interpolation=cv2.INTER_LINEAR)
+        m_c, d_c = mask[y:y + h, x:x + w], disp[y:y + h, x:x + w]
+
+        # Table anchor: median disparity of a ring around the product, well
+        # clear of its shadowed edge — the height-0 reference the camera
+        # distance below is measured against.
+        ring_in  = cv2.dilate(mask.astype(np.uint8),
+                              np.ones((2 * (max(w, h) // 40) + 1,) * 2,
+                                      np.uint8)).astype(bool)
+        ring_out = cv2.dilate(ring_in.astype(np.uint8),
+                              np.ones((2 * (max(w, h) // 8) + 1,) * 2,
+                                      np.uint8)).astype(bool)
+        ring = ring_out & ~ring_in
+        d_table = float(np.median(disp[ring])) if ring.any() else None
+
+        # Camera height above the table, from the ONE ruler already in every
+        # frame: the product itself, whose real width/depth Stage 2 already
+        # measured. pixel_size = fx * real_size / distance (pinhole), solved
+        # both ways (long axis vs short axis) and averaged. This replaces
+        # trying to discover the disparity->height curve's shape from the
+        # image alone, which was never well-posed — the shell's own height
+        # range is a few cm, and the cavity floor is pure extrapolation
+        # below it, degenerate with only the table as a second point (v1
+        # here compressed the true 7.9cm mouth to 4-6cm). With H_cam known,
+        # height = H_cam * (1 - d_table / disparity) is Step 5's own
+        # k = distance * disparity relation, just anchored on the product's
+        # measured size instead of the A4 sheet.
+        H_cam = None
+        if fx and d_table:
+            long_m, short_m = (max(dims_cm['width'], dims_cm['depth']) / 100,
+                               min(dims_cm['width'], dims_cm['depth']) / 100)
+            axis_m = (long_m, short_m) if w >= h else (short_m, long_m)
+            H_cam = 0.5 * (fx * axis_m[0] / w + fy * axis_m[1] / h)
+
+        k = _topdown_rotation_k(m_c.shape, view, rows, cols, name)
+        if k:
+            m_c, d_c = np.rot90(m_c, k), np.rot90(d_c, k)
+        m_f = cv2.resize(m_c.astype(np.float32), (cols, rows),
+                         interpolation=cv2.INTER_AREA) >= 0.5
+        d_f = cv2.resize(d_c, (cols, rows), interpolation=cv2.INTER_AREA)
+        fields.append((orient_to_grid(d_f, view), orient_to_grid(m_f, view),
+                       d_table, H_cam))
+    return fields
+
+
+def _height_m(disp, d_table, H_cam, valid, surf_y, voxel_y_m):
+    """height above the table (metres), from the model's own affine-invariant
+    disparity relation  disp = k/distance + shift  (Depth Anything's stated
+    form — see depth_estimation.py's docstring), i.e.
+        distance = k / (disp - shift)   =>   height = H_cam - k/(disp - shift)
+
+    k and shift are solved EXACTLY from two real anchors, not fitted:
+      1. the table (height 0, disparity d_table — already known)
+      2. the shell's closest points (disparity's own 95th percentile within
+         the mask — by definition nearer the camera than anything else
+         visible, so guaranteed to be raised material — laces/tongue —
+         never the recessed interior), whose height is read off the HULL,
+         which is trustworthy there (silhouette carving is only wrong
+         inside cavities).
+    Two anchors exactly fix the two unknowns in a 2-parameter family — no
+    search, no ambiguity. Assuming shift=0 (v1 here) instead systematically
+    undershot the cavity by 2-4x: with only the table point actually
+    constraining the curve, shift was implicitly forced to 0 regardless of
+    the model's real (nonzero) affine offset."""
+    d_ok = disp[valid]
+    d_rim = float(np.percentile(d_ok, 95))
+    rim_px = valid & (disp >= d_rim)
+    h_rim = float(np.median(surf_y[rim_px])) * voxel_y_m   # metres, above table
+    denom = h_rim if abs(h_rim) > 1e-6 else 1e-6
+    shift = (H_cam * (d_table - d_rim) + h_rim * d_rim) / denom
+    k = H_cam * (d_table - shift)
+    return H_cam - k / np.maximum(disp - shift, 1e-3)
+
+
+def depth_carve(occ, view, fields, voxel_y_m):
+    """Carve the concavity a top/bottom view saw into the hull (Report 21).
+
+    Grid work happens 'as seen from above': for the bottom view the volume
+    is flipped in Y first so one code path serves both. Per frame the
+    disparity is fitted to the hull surface (_fit_floor); the per-frame
+    floors are median-combined; pixels whose floor sits well below the hull
+    surface are the cavity (small speckle components dropped); the floor is
+    clamped so at least a few voxels of wall/sole survive, smoothed so
+    per-pixel depth noise doesn't texture the cavity walls, and everything
+    above it is cleared."""
+    work = occ[:, ::-1, :] if view == 'bottom' else occ
+    nx, ny, nz = work.shape
+    ys = np.arange(ny)[None, :, None]
+    surf_y = np.max(np.where(work, ys, -1), axis=1)          # hull lid height
+    base_y = np.min(np.where(work, ys, ny), axis=1)          # opposite face
+    inside = surf_y >= 0
+
+    # mask edges blend product depth into background depth — same lesson the
+    # probe tool learned; erode each frame's valid region before fitting.
+    # The bleed is wide: the depth model works at ~518px internally, so its
+    # edges smear across tens of face pixels, not a few
+    ek = max(3, RESOLUTION // 64) | 1
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (ek, ek))
+
+    floors = []
+    for disp, m, d_table, H_cam in fields:
+        if not d_table or not H_cam or H_cam <= 0:
+            print(f"    [!] {view}: frame missing a table/camera anchor — skipped")
+            continue
+        valid = cv2.erode((m & inside).astype(np.uint8), kernel).astype(bool)
+        if valid.sum() < 256:
+            print(f"    [!] {view}: too little valid area after erosion — frame skipped")
+            continue
+        floor = _height_m(disp, d_table, H_cam, valid, surf_y, voxel_y_m) / voxel_y_m
+        # the floor field must live on the ERODED mask, not the full one:
+        # at the silhouette edge the depth map blends product into table,
+        # and that ring of near-zero floor heights cuts a drain channel
+        # through the thin collar rim — the sink-fill test then thinks the
+        # mouth can't hold water (spill level 1.8 cm on the sneaker) and
+        # refuses to call it a cavity
+        floors.append(np.where(valid, floor, np.nan))
+    if not floors:
+        print(f"    [!] {view}: no frame survived anchoring — depth carve skipped")
+        return occ
+
+    with np.errstate(invalid='ignore'):
+        floor = np.nanmedian(np.stack(floors), axis=0)
+    known = inside & ~np.isnan(floor)
+
+    # A cavity is a RIM-ENCLOSED depression — a pit the depth surface could
+    # hold water in — not just "deeper than the fit expected". Sink-fill the
+    # height field from its borders (morphological reconstruction by
+    # erosion, the DEM fill-sinks operation): pixels that hold water are
+    # cavity; anything that drains off the silhouette edge — the toe box's
+    # honest downhill slope, any smooth perspective/affine ramp the linear
+    # fit left behind — is provably not. Outside the footprint the field is
+    # set very low so the border drains.
+    from skimage.morphology import reconstruction
+    low = float(np.nanmin(np.where(known, floor, np.nan))) - float(ny)
+    field_h = np.where(known, floor, low).astype(np.float32)
+    # narrow false drain channels — shadowed slots between laces read as
+    # deep as the cavity and chain it to the outside, so the raw field's
+    # mouth "leaks" and never registers as a pit (measured spill level:
+    # 1.8 cm). Grayscale-close with a kernel wider than a lace gap but far
+    # narrower than the opening: slots get bridged, the mouth cannot be.
+    # Enclosure is tested on the closed field; carving still uses the true
+    # floor, and at the bridged slots the closed field sits at lid level so
+    # the lace bridge itself is never carved.
+    kc = max(9, RESOLUTION // 24) | 1
+    closed = cv2.morphologyEx(
+        field_h, cv2.MORPH_CLOSE,
+        cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (kc, kc)))
+    seed = np.full_like(closed, closed.max())
+    seed[0, :], seed[-1, :], seed[:, 0], seed[:, -1] = \
+        closed[0, :], closed[-1, :], closed[:, 0], closed[:, -1]
+    filled = reconstruction(seed, closed, method='erosion')
+    pit = filled - closed
+
+    # margin keeps honest fit scatter from nibbling the surface; requiring
+    # the lid to also sit well above the floor skips no-op carves
+    margin = max(3.0, ny / 48)
+    cavity = known & (pit > margin) & (surf_y - floor > margin)
+    # round off the cavity boundary: a jagged contour forces a steep,
+    # high-curvature rim wall into the mesh (fine at full res, but exactly
+    # the kind of thin feature quadric decimation later collapses into a
+    # gap — texture_hull.py's 20k-face pass on an earlier build did this on
+    # one side of this same mouth)
+    ok = max(3, RESOLUTION // 128) | 1
+    cavity = cv2.morphologyEx(cavity.astype(np.uint8), cv2.MORPH_OPEN,
+                              cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (ok, ok))
+                              ).astype(bool)
+    n_lbl, lbl, stats, _ = cv2.connectedComponentsWithStats(
+        cavity.astype(np.uint8), connectivity=8)
+    min_area = max(16, int(inside.sum()) // 200)
+    cavity &= np.isin(lbl, [i for i in range(1, n_lbl)
+                            if stats[i, cv2.CC_STAT_AREA] >= min_area])
+    if not cavity.any():
+        print(f"    {view}: no cavity found beyond the {margin:.0f}-voxel "
+              f"margin — nothing carved")
+        return occ
+
+    if DEPTH_CARVE_GAIN != 1.0:
+        # deepen about each column's own lid (preserves the vision-derived
+        # SHAPE — where the pocket is deeper/shallower — and only rescales
+        # the magnitude to match a real measurement)
+        floor = np.where(cavity, surf_y - (surf_y - floor) * DEPTH_CARVE_GAIN, floor)
+
+    # never carve through the far side: keep a few voxels of sole/shell
+    shell = max(2, ny // 64)
+    floor = np.maximum(floor, base_y + shell)
+    # smooth the floor field so pixel noise doesn't ripple the cavity walls;
+    # fill non-cavity pixels with the lid height first so the blur doesn't
+    # drag rim heights down
+    field = np.where(cavity, floor, surf_y).astype(np.float32)
+    field = cv2.GaussianBlur(field, (0, 0), 1.5)
+
+    clear = cavity[:, None, :] & (ys > field[:, None, :])
+    carved = int((work & clear).sum())
+    work &= ~clear
+    depth_vox = (surf_y - field)[cavity]
+    print(f"    {view}: cavity {cavity.sum():,} columns, depth "
+          f"{np.median(depth_vox) * voxel_y_m * 100:.1f} cm median / "
+          f"{depth_vox.max() * voxel_y_m * 100:.1f} cm max "
+          f"({carved:,} voxels cleared)")
+    return work[:, ::-1, :] if view == 'bottom' else work
 
 
 # ---------------------------------------------------------------- meshing
@@ -376,6 +796,9 @@ def embed_provenance(glb_path, dims_cm, stage2_meta, views_used, grid_shape):
         'side_captured_from': SIDE_FROM if 'side' in views_used else None,
         'holes_filled_views': sorted(FILL_HOLES_VIEWS & set(views_used)),
         'cross_section':      CROSS_SECTION,
+        'depth_carve':        sorted(DEPTH_CARVE_VIEWS) or None,
+        'depth_carve_gain':   DEPTH_CARVE_GAIN if DEPTH_CARVE_VIEWS else None,
+        'topdown_front':      TOPDOWN_FRONT,
         'smooth_iterations':  SMOOTH_ITERATIONS,
         'profile_smooth':     PROFILE_SMOOTH,
         'sil_smooth':         SIL_SMOOTH,
@@ -429,6 +852,19 @@ def main():
         print("[!] Almost nothing survived the carve — a view's mask is likely")
         print("    misassigned (e.g. side masks in the front folder). Aborting.")
         sys.exit(1)
+
+    if DEPTH_CARVE_VIEWS:
+        print("[*] Depth-carving openings...")
+        calib = _load_calibration()
+        if calib is None:
+            print(f"    [!] No calibration at {CALIB_FILE} — depth carve "
+                  f"needs it to anchor real units. Skipping.")
+        for view in sorted(DEPTH_CARVE_VIEWS) if calib else []:
+            fields = load_view_depthfields(view, *face_res[view], dims_cm, calib)
+            if not fields:
+                print(f"    [!] {view}: no usable depth frames — skipped")
+                continue
+            occ = depth_carve(occ, view, fields, voxel[1])
 
     print("[*] Marching cubes + smoothing...")
     mesh = voxels_to_mesh(occ, voxel)

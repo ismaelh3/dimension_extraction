@@ -16,7 +16,10 @@ asset_generation_step/work/
 asset_generation_step/masks/
 asset_generation_step/capture_sets/
 asset_generation_step/raw_models/
-
+measurement_extraction_step/output/*
+depth_in_openings_research.md
+Reconstruction_Pipeline_Iteration_Log.pdf
+.claude
 
 # model weights (auto-downloaded)
 *.pt

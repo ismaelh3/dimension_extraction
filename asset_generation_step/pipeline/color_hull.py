@@ -36,6 +36,11 @@ import trimesh
 from pygltflib import GLTF2
 
 BASE_DIR   = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))  # asset_generation_step/
+sys.path.insert(0, os.path.join(BASE_DIR, 'pipeline'))
+# single source of truth for the TOPDOWN_FRONT env knob (and its parsing):
+# the carve rotates 90°-off top/bottom masks, so sampling must un-rotate
+# with the exact same per-view direction or colors land transposed
+from build_silhouette_mesh import TOPDOWN_FRONT_SIDES  # noqa: E402
 SUBJECT_ID = os.environ.get('SUBJECT', 'product_000')
 SIDE_FROM  = os.environ.get('SIDE_FROM', 'right')
 FRAMES_DIR = os.environ.get('FRAMES_DIR', os.path.join(
@@ -105,13 +110,23 @@ def view_uv(view, X, Y, Z):
     raise ValueError(view)
 
 
-def sample_view(view, X, Y, Z, cam, dist, calib_wh):
-    """Median per-vertex color across all of a view's frames, or None."""
+def sample_view(view, X, Y, Z, cam, dist, calib_wh, extents=None):
+    """Median per-vertex color across all of a view's frames, or None.
+
+    extents (mesh W/H/D in metres) enables the same transposed-photo
+    detection the carve does: a top/bottom mask whose tight bbox matches the
+    transposed aspect gets its sample coordinates un-rotated (the inverse of
+    build_silhouette_mesh.fix_topdown_rotation, per TOPDOWN_FRONT)."""
     mask_paths = sorted(glob.glob(os.path.join(MASKS_DIR, view, '*.png')))
     if not mask_paths:
         return None
     u, v = view_uv(view, X, Y, Z)
-    samples = []
+    expected = None
+    if extents is not None and view in ('top', 'bottom'):
+        expected = extents[0] / extents[2]                # W/D, photo cols/rows
+        if 0.8 < expected < 1.25:
+            expected = None                               # near-square: ambiguous
+    samples, unrotated = [], 0
     for mp in mask_paths:
         stem = os.path.basename(mp).replace('_product_mask.png', '')
         hits = glob.glob(os.path.join(FRAMES_DIR, stem + '.*'))
@@ -127,12 +142,25 @@ def sample_view(view, X, Y, Z, cam, dist, calib_wh):
         matrix = scale_matrix_to_frame(cam, calib_wh, (w, h))
         frame = undistort_frame(frame, matrix, dist)
         x0, y0, bw, bh = cv2.boundingRect(cv2.findNonZero((mask > 127).astype(np.uint8)))
-        cols = np.clip(x0 + u * (bw - 1), 0, w - 1).astype(np.int32)
-        rows = np.clip(y0 + v * (bh - 1), 0, h - 1).astype(np.int32)
+        uf, vf = u, v
+        if expected is not None and \
+                abs(np.log((bw / bh) / (1 / expected))) < abs(np.log((bw / bh) / expected)):
+            # photo is 90° off convention — sample where the carve's rotation
+            # would have read from: ccw rotation k=1 inverts as (1-v, u),
+            # cw k=3 as (v, 1-u)
+            if TOPDOWN_FRONT_SIDES[view] == 'left':
+                uf, vf = 1 - v, u
+            else:
+                uf, vf = v, 1 - u
+            unrotated += 1
+        cols = np.clip(x0 + uf * (bw - 1), 0, w - 1).astype(np.int32)
+        rows = np.clip(y0 + vf * (bh - 1), 0, h - 1).astype(np.int32)
         samples.append(frame[rows, cols][:, ::-1])        # BGR -> RGB
     if not samples:
         return None
-    print(f"    {view:<6} — {len(samples)} frame(s) sampled")
+    note = (f"  ({unrotated} transposed frame(s) un-rotated, "
+            f"TOPDOWN_FRONT {view}:{TOPDOWN_FRONT_SIDES[view]})" if unrotated else '')
+    print(f"    {view:<6} — {len(samples)} frame(s) sampled{note}")
     return np.median(np.stack(samples), axis=0).astype(np.float32)
 
 
@@ -161,7 +189,7 @@ def main():
     colors, weights = {}, {}
     nx, ny, nz = normals.T
     for view in VIEWS:
-        col = sample_view(view, X, Y, Z, cam, dist, calib_wh)
+        col = sample_view(view, X, Y, Z, cam, dist, calib_wh, extents=hi - lo)
         if col is None:
             continue
         colors[view] = col
