@@ -496,7 +496,7 @@ def _load_calibration():
 
 
 def load_view_depthfields(view, rows, cols, dims_cm, calib):
-    """Per-frame (disparity, mask, d_table, H_cam) tuples on the view's face
+    """Per-frame (disparity, mask, added, d_table, H_cam) tuples on the view's face
     grid, put through the SAME transform chain as the silhouettes (fill ->
     crop -> rotation -> resize -> orient) so pixel (ix, iz) means the same
     place in both.
@@ -506,7 +506,9 @@ def load_view_depthfields(view, rows, cols, dims_cm, calib):
     one is anchored to real units (depth_carve does that) — averaging raw
     disparities across frames would mix incompatible scales. Masks are
     always hole-filled here: SAM speckles on cavity interiors (dark insoles)
-    would drop exactly the pixels the carve exists to use."""
+    would drop exactly the pixels the carve exists to use. The filled-in
+    pixels are tracked separately ('added') because that same fill also seals
+    genuine see-through gaps, where the depth behind the gap is a lie."""
     fx, fy, calib_wh = calib if calib else (None, None, None)
     fields = []
     for mp in sorted(glob.glob(os.path.join(MASKS_DIR, view, '*_product_mask.png'))):
@@ -520,7 +522,12 @@ def load_view_depthfields(view, rows, cols, dims_cm, calib):
         img = cv2.imread(mp, cv2.IMREAD_GRAYSCALE)
         if img is None:
             continue
-        mask = fill_holes(img > 127)
+        raw  = img > 127
+        mask = fill_holes(raw)
+        # Which pixels fill_holes INVENTED. They are not observed product, so
+        # their disparity is whatever happened to be behind the gap — see
+        # depth_carve, which drops the ones that turn out to be see-through.
+        added = mask & ~raw
         pts = cv2.findNonZero(mask.astype(np.uint8))
         if pts is None or len(pts) < MIN_MASK_AREA_PX:
             continue
@@ -530,6 +537,7 @@ def load_view_depthfields(view, rows, cols, dims_cm, calib):
             disp = cv2.resize(disp, (mask.shape[1], mask.shape[0]),
                               interpolation=cv2.INTER_LINEAR)
         m_c, d_c = mask[y:y + h, x:x + w], disp[y:y + h, x:x + w]
+        a_c = added[y:y + h, x:x + w]
 
         # Table anchor: median disparity of a ring around the product, well
         # clear of its shadowed edge — the height-0 reference the camera
@@ -565,11 +573,16 @@ def load_view_depthfields(view, rows, cols, dims_cm, calib):
         k = _topdown_rotation_k(m_c.shape, view, rows, cols, name)
         if k:
             m_c, d_c = np.rot90(m_c, k), np.rot90(d_c, k)
+            a_c = np.rot90(a_c, k)
         m_f = cv2.resize(m_c.astype(np.float32), (cols, rows),
                          interpolation=cv2.INTER_AREA) >= 0.5
         d_f = cv2.resize(d_c, (cols, rows), interpolation=cv2.INTER_AREA)
+        # any coverage counts as 'invented' — a half-covered pixel is still
+        # part-background, so its depth is still not honest product
+        a_f = cv2.resize(a_c.astype(np.float32), (cols, rows),
+                         interpolation=cv2.INTER_AREA) > 0
         fields.append((orient_to_grid(d_f, view), orient_to_grid(m_f, view),
-                       d_table, H_cam))
+                       orient_to_grid(a_f, view), d_table, H_cam))
     return fields
 
 
@@ -627,8 +640,8 @@ def depth_carve(occ, view, fields, voxel_y_m):
     ek = max(3, RESOLUTION // 64) | 1
     kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (ek, ek))
 
-    floors = []
-    for disp, m, d_table, H_cam in fields:
+    floors, n_leak = [], 0
+    for disp, m, added, d_table, H_cam in fields:
         if not d_table or not H_cam or H_cam <= 0:
             print(f"    [!] {view}: frame missing a table/camera anchor — skipped")
             continue
@@ -637,6 +650,21 @@ def depth_carve(occ, view, fields, voxel_y_m):
             print(f"    [!] {view}: too little valid area after erosion — frame skipped")
             continue
         floor = _height_m(disp, d_table, H_cam, valid, surf_y, voxel_y_m) / voxel_y_m
+
+        # fill_holes patches SAM speckle over cavity interiors (necessary —
+        # dark linings drop out), but it also seals genuine SEE-THROUGH gaps.
+        # A snapback cap's strap opening became 'product' whose depth is the
+        # TABLE showing through it, so the fit drove the floor to table level
+        # there and the carve punched a tunnel out the back of the crown
+        # (the mesh went from genus 0 to genus 1). Observed product always
+        # sits raised above the table, so an INVENTED pixel reading at table
+        # height was never product — drop it rather than carve to it. Only
+        # invented pixels are eligible, so honest interior surface that
+        # happens to sit low (a shoe's insole) is never rejected.
+        leak = added & (floor <= max(2.0, ny / 64))
+        if leak.any():
+            valid &= ~leak
+            n_leak += int(leak.sum())
         # the floor field must live on the ERODED mask, not the full one:
         # at the silhouette edge the depth map blends product into table,
         # and that ring of near-zero floor heights cuts a drain channel
@@ -647,6 +675,9 @@ def depth_carve(occ, view, fields, voxel_y_m):
     if not floors:
         print(f"    [!] {view}: no frame survived anchoring — depth carve skipped")
         return occ
+    if n_leak:
+        print(f"    {view}: {n_leak:,} see-through px rejected "
+              f"(hole-filled gaps reading at table height)")
 
     with np.errstate(invalid='ignore'):
         floor = np.nanmedian(np.stack(floors), axis=0)
@@ -710,14 +741,41 @@ def depth_carve(occ, view, fields, voxel_y_m):
         # the magnitude to match a real measurement)
         floor = np.where(cavity, surf_y - (surf_y - floor) * DEPTH_CARVE_GAIN, floor)
 
-    # never carve through the far side: keep a few voxels of sole/shell
-    shell = max(2, ny // 64)
-    floor = np.maximum(floor, base_y + shell)
+    # never carve through the far side: keep a few voxels of sole/shell.
+    # The reserve must also survive VOLUME_SMOOTH, which blurs the occupancy
+    # AFTER this clamp: a wall thinner than a few sigma washes below the 0.5
+    # iso-level and marching cubes never emits it, so the shell silently
+    # perforates (the cap's crown tore into 3 extra holes at gain 1.53 —
+    # genus 1 -> 4 — while this guard still "reserved" its 3 voxels).
+    shell = max(2, ny // 64, int(np.ceil(2.5 * VOLUME_SMOOTH)))
+    # ...but `shell` is a VERTICAL reserve, while wall thickness is measured
+    # PERPENDICULAR to the surface. Where the far surface is steep, a vertical
+    # reserve of N voxels is only N*cos(slope) of actual wall, and that goes
+    # to zero as the surface turns vertical — so this guard protected the flat
+    # apex and did nothing on the flanks. That is exactly where the cap tore:
+    # one 2.8 x 1.7 cm hole at 2-4 cm height on the crown's side, never near
+    # the top. Scale by 1/cos(slope) = sqrt(1 + |grad base_y|^2) so the
+    # perpendicular thickness is what stays constant. base_y is smoothed
+    # first (its raw per-column gradient is voxel-staircase noise) and the
+    # factor is capped, since the gradient blows up at the silhouette edge.
+    # The grid is isotropic here, so gradient in voxel units needs no rescale.
+    base_s = cv2.GaussianBlur(np.where(inside, base_y, 0).astype(np.float32),
+                              (0, 0), 2.0)
+    g0, g1 = np.gradient(base_s)
+    shell_v = shell * np.minimum(np.sqrt(1.0 + g0 ** 2 + g1 ** 2), 8.0)
+    floor = np.maximum(floor, base_y + shell_v)
     # smooth the floor field so pixel noise doesn't ripple the cavity walls;
     # fill non-cavity pixels with the lid height first so the blur doesn't
     # drag rim heights down
     field = np.where(cavity, floor, surf_y).astype(np.float32)
     field = cv2.GaussianBlur(field, (0, 0), 1.5)
+    # Re-assert the shell reserve AFTER the blur. Clamping only before it is
+    # not enough: the blur mixes each column's floor with its neighbours',
+    # and where base_y falls away steeply (the crown's flanks) a neighbour's
+    # legitimately-lower floor drags this column below its OWN reserve and
+    # the carve punches through. Clamping pre-blur alone shattered the cap's
+    # crown into ~20 small handles instead of one clean tear.
+    field = np.maximum(field, (base_y + shell_v).astype(np.float32))
 
     clear = cavity[:, None, :] & (ys > field[:, None, :])
     carved = int((work & clear).sum())

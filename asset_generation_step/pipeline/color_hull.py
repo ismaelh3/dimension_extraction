@@ -28,6 +28,7 @@ import glob
 import os
 import pickle
 import sys
+import warnings
 from datetime import datetime
 
 import cv2
@@ -155,13 +156,24 @@ def sample_view(view, X, Y, Z, cam, dist, calib_wh, extents=None):
             unrotated += 1
         cols = np.clip(x0 + uf * (bw - 1), 0, w - 1).astype(np.int32)
         rows = np.clip(y0 + vf * (bh - 1), 0, h - 1).astype(np.int32)
-        samples.append(frame[rows, cols][:, ::-1])        # BGR -> RGB
+        samp = frame[rows, cols][:, ::-1].astype(np.float32)   # BGR -> RGB
+        # Only PRODUCT pixels are a valid sample. Nothing constrained this
+        # before, so a point projecting off the product took whatever was
+        # behind it — and FILL_HOLES makes that routine: it seals a gap in
+        # the MASK (a snapback's strap opening) while the PHOTO still shows
+        # the dark table through it, so cavity texels sampling there baked
+        # black. NaN marks "no data from this view"; callers must drop it
+        # from the blend rather than average it in.
+        samp[mask[rows, cols] <= 127] = np.nan
+        samples.append(samp)
     if not samples:
         return None
     note = (f"  ({unrotated} transposed frame(s) un-rotated, "
             f"TOPDOWN_FRONT {view}:{TOPDOWN_FRONT_SIDES[view]})" if unrotated else '')
     print(f"    {view:<6} — {len(samples)} frame(s) sampled{note}")
-    return np.median(np.stack(samples), axis=0).astype(np.float32)
+    with warnings.catch_warnings():                # all-NaN = seen by no frame
+        warnings.simplefilter('ignore', RuntimeWarning)
+        return np.nanmedian(np.stack(samples), axis=0).astype(np.float32)
 
 
 # ------------------------------------------------- main
@@ -192,7 +204,10 @@ def main():
         col = sample_view(view, X, Y, Z, cam, dist, calib_wh, extents=hi - lo)
         if col is None:
             continue
-        colors[view] = col
+        # NaN = no product pixel for that vertex in this view; the weight
+        # carries the validity so it contributes nothing (see sample_view).
+        seen = np.isfinite(col).all(axis=1)
+        colors[view] = np.nan_to_num(col)
         if view == 'front':
             # |nz|: back faces mirror the front photo unless a back set exists
             weights[view] = (np.maximum(nz, 0) if 'back' in colors or
@@ -206,6 +221,7 @@ def main():
             weights[view] = np.maximum(ny, 0) ** BLEND_POWER
         elif view == 'bottom':
             weights[view] = np.maximum(-ny, 0) ** BLEND_POWER
+        weights[view] = weights[view] * seen
     if 'front' not in colors:
         print("[!] Front view is required for the color pass.")
         sys.exit(1)

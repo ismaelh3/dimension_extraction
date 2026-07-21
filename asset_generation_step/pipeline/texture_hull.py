@@ -44,6 +44,53 @@ OUT_GLB      = os.path.join(BASE_DIR, 'work', f'{SUBJECT_ID}_textured.glb')
 DEBUG_PNG    = os.path.join(BASE_DIR, 'work', f'{SUBJECT_ID}_texture_debug.png')
 
 
+def _front_most(u, v, depth, res, tol):
+    """Points at (or within tol of) the nearest depth for their photo pixel.
+
+    The views are axis-aligned orthographic in normalized box coords, so a
+    depth buffer needs no rasterizer: view_uv's (u, v) depend only on the two
+    axes perpendicular to the view direction, so points sharing a cell lie on
+    one camera ray. The texel set already covers the surface densely enough
+    to serve as its own depth samples.
+    """
+    iu = np.clip((np.asarray(u) * (res - 1)).astype(np.int32), 0, res - 1)
+    iv = np.clip((np.asarray(v) * (res - 1)).astype(np.int32), 0, res - 1)
+    cell = iv * res + iu
+    nearest = np.full(res * res, np.inf, np.float32)
+    np.minimum.at(nearest, cell, depth.astype(np.float32))
+    return depth <= nearest[cell] + tol
+
+
+def visible_from(view, X, Y, Z, comp, two_sided, res=512, tol=0.01):
+    """Can this view actually SEE each point, or is the surface in the way?
+
+    Without this, a point was sampled from any view its NORMAL roughly faced
+    whether or not that view could see it: the shoe's mouth interior was
+    painted with the swoosh from the outer side wall, and the cap's far side
+    sampled the back photo through the snapback's strap opening (which shows
+    unlit interior — true black).
+
+    `two_sided` is the subtlety. Some views are deliberately MIRRORED: with
+    no back capture, front is weighted by |nz| so it also paints back faces,
+    and side is always |nx| so one flank's photo serves both. Testing those
+    against a single camera direction throws away exactly the samples the
+    mirror is there to provide (it turned the shoe's far side into flood-fill
+    blotches). So for a mirrored view, test each point against whichever of
+    the two opposed directions it faces, given by `comp` (its normal's
+    component along the view axis).
+    """
+    u, v = color_hull.view_uv(view, X, Y, Z)
+    axis = {'front': Z, 'back': Z, 'top': Y, 'bottom': Y, 'side': X}[view]
+    if two_sided:
+        return np.where(comp >= 0,
+                        _front_most(u, v, 1 - axis, res, tol),
+                        _front_most(u, v, axis, res, tol))
+    # single direction: which end of the axis the camera sits at
+    near_high = view in ('front', 'top') or (view == 'side' and
+                                             color_hull.SIDE_FROM == 'right')
+    return _front_most(u, v, (1 - axis) if near_high else axis, res, tol)
+
+
 def blend_points(X, Y, Z, normals, cam, dist, calib_wh, extents=None):
     """color_hull's sample-and-blend, for arbitrary surface points (the
     vertex pass runs this on vertices; the bake runs it on texel centers)."""
@@ -54,20 +101,38 @@ def blend_points(X, Y, Z, normals, cam, dist, calib_wh, extents=None):
                                      extents=extents)
         if col is None:
             continue
-        colors[view] = col
+        # NaN = this view has no product pixel for that point (see
+        # color_hull.sample_view). Keep the color array finite and let the
+        # weight carry the validity, so an off-product sample contributes
+        # nothing instead of dragging the blend toward the background.
+        seen = np.isfinite(col).all(axis=1)
+        colors[view] = np.nan_to_num(col)
+        # `comp` is the normal's component along the view axis; `two_sided`
+        # marks the views weighted by |comp| — i.e. deliberately mirrored to
+        # cover the faces we never photographed (see visible_from).
         if view == 'front':
             has_back = 'back' in colors or glob.glob(
                 os.path.join(color_hull.MASKS_DIR, 'back', '*.png'))
+            two_sided = not has_back
+            comp = nz
             weights[view] = (np.maximum(nz, 0) if has_back
                              else np.abs(nz)) ** color_hull.BLEND_POWER
         elif view == 'back':
+            two_sided, comp = False, -nz
             weights[view] = np.maximum(-nz, 0) ** color_hull.BLEND_POWER
         elif view == 'side':
+            # comp is along +X (visible_from's convention); SIDE_FROM picks
+            # which photo is mirrored, not which way the geometry faces
+            two_sided, comp = True, nx
             weights[view] = np.abs(nx) ** color_hull.BLEND_POWER
         elif view == 'top':
+            two_sided, comp = False, ny
             weights[view] = np.maximum(ny, 0) ** color_hull.BLEND_POWER
         elif view == 'bottom':
+            two_sided, comp = False, -ny
             weights[view] = np.maximum(-ny, 0) ** color_hull.BLEND_POWER
+        weights[view] = weights[view] * seen * visible_from(
+            view, X, Y, Z, comp, two_sided)
     if 'front' not in colors:
         print("[!] Front view is required for the texture bake.")
         sys.exit(1)
