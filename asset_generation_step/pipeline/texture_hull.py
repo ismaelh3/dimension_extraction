@@ -39,6 +39,7 @@ from fidelity_sweep import decimate        # noqa: E402
 SUBJECT_ID   = os.environ.get('SUBJECT', 'product_000')
 TARGET_FACES = int(os.environ.get('TARGET_FACES', '20000'))
 TEXTURE_SIZE = int(os.environ.get('TEXTURE_SIZE', '2048'))
+DESPECKLE    = float(os.environ.get('DESPECKLE', '0'))  # 0=off; >0 = blur radius
 HULL_GLB     = os.path.join(BASE_DIR, 'work', f'{SUBJECT_ID}_hull.glb')
 OUT_GLB      = os.path.join(BASE_DIR, 'work', f'{SUBJECT_ID}_textured.glb')
 DEBUG_PNG    = os.path.join(BASE_DIR, 'work', f'{SUBJECT_ID}_texture_debug.png')
@@ -186,6 +187,25 @@ def dilate_texture(tex, filled):
     return tex[iy, ix]
 
 
+def despeckle_atlas(tex, blur):
+    """Optional post-bake cleanup: replace ISOLATED near-black texels (the
+    black/gold flecks at silhouette edges + neighbor-filled cavities) with their
+    local median, leaving large contiguous dark regions (a real dark back)
+    intact, then a light blur for a smooth figurine surface. A texel is a speck
+    if it is near-black yet its neighborhood median is not."""
+    from PIL import ImageFilter
+    med = np.asarray(Image.fromarray(tex).filter(ImageFilter.MedianFilter(5)),
+                     np.uint8)
+    s = tex.astype(int).sum(2)
+    med_s = med.astype(int).sum(2)
+    speck = (s < 95) & (med_s > 150)
+    out = tex.copy()
+    out[speck] = med[speck]
+    print(f"    despeckled {int(speck.sum()):,} texels, blur {blur}")
+    return np.asarray(Image.fromarray(out).filter(ImageFilter.GaussianBlur(blur)),
+                      np.uint8)
+
+
 def main():
     print("=" * 60)
     print("STAGE 3 — UV TEXTURE BAKE (M2 v2)")
@@ -247,6 +267,9 @@ def main():
     filled[row, tx] = has_data
     print("[*] Dilating island borders...")
     tex = dilate_texture(tex, filled)
+    if DESPECKLE > 0:
+        print("[*] Despeckling atlas...")
+        tex = despeckle_atlas(tex, DESPECKLE)
     Image.fromarray(tex).save(DEBUG_PNG)
 
     print("[*] Exporting glb...")

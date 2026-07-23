@@ -1,0 +1,11 @@
+subject: perfume-bottle
+prompt: perfume bottle.
+class: transparent_hollow
+geometry: generative
+multi_instance: false
+interior:
+  mode: none
+frames_dir: /Users/ismaelh./Elysium/Dimension Extraction/instance_segmentation_step/frames
+render_scene: none
+overrides:
+  THICKNESS: '0'   # solid glass — thin-shell solidify shatters on the bumpy generative cap

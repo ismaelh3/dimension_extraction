@@ -25,5 +25,8 @@ Reconstruction_Pipeline_Iteration_Log.pdf
 *.pt
 *.ts
 
+# vendored generative model (cloned + patched by tools/setup_triposr.py)
+third_party/
+
 # generated reports (rebuilt by the sweep scripts)
 asset_generation_step/*.pdf

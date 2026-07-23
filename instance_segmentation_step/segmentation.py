@@ -11,8 +11,8 @@ from transformers import AutoProcessor, AutoModelForZeroShotObjectDetection
 # -------------------------------------- Configuration --------------------------------------
 
 SCRIPT_DIR  = os.path.dirname(os.path.abspath(__file__))  # folder this script lives in, so paths work from any cwd
-FRAMES_DIR  = os.path.join(SCRIPT_DIR, 'frames')          # folder containing your captured product frames
-OUTPUT_DIR  = os.path.join(SCRIPT_DIR, 'output')          # all results written here (local to this step)
+FRAMES_DIR  = os.environ.get('FRAMES_DIR', os.path.join(SCRIPT_DIR, 'frames'))  # captured product frames
+OUTPUT_DIR  = os.environ.get('OUTPUT_DIR', os.path.join(SCRIPT_DIR, 'output'))  # all results written here (local to this step)
 CALIB_FILE  = os.path.join(SCRIPT_DIR, '..', 'camera_calibration_step', 'output', 'calibration_data.pkl')
 # Grounded-SAM: Grounding DINO FINDS the product (text-prompted, boxes only),
 # then SAM 2 segments whatever the box points at. Grounding DINO fuses a language
@@ -27,13 +27,20 @@ SAM2_MODEL = os.path.join(SCRIPT_DIR, 'sam2.1_b.pt')   # downloads automatically
 # Change this per product you measure. (The model expects lowercase text ending
 # in a period; normalise_prompt() applies that automatically.)
 # Defaul Placeholder: 'INSERT_PRODUCT_NAME.'
-PRODUCT_PROMPT = 'white sneaker.'
+PRODUCT_PROMPT = os.environ.get('PRODUCT_PROMPT', 'clear perfume bottle.')
 
 # Detection thresholds. BOX: minimum confidence for a detection to count at all.
 # TEXT: how strongly the detection must match the words of the prompt.
 # Lower them if the product isn't being found; raise them if the wrong thing is.
-BOX_THRESHOLD  = 0.35
-TEXT_THRESHOLD = 0.25
+BOX_THRESHOLD  = float(os.environ.get('BOX_THRESHOLD', '0.35'))
+TEXT_THRESHOLD = float(os.environ.get('TEXT_THRESHOLD', '0.25'))
+
+# Multi-instance union. Normally the single highest-scoring detection is kept.
+# For a subject that is really a CLUSTER the pipeline should treat as one object
+# (e.g. a penguin FAMILY inside a snowglobe — adult + chicks), set MULTI_INSTANCE=1
+# to keep every detection at/above threshold and union their SAM masks into one
+# product mask. The A4/scale path is unaffected.
+MULTI_INSTANCE = os.environ.get('MULTI_INSTANCE', '0') not in ('0', '', 'false', 'False')
 
 # Where to run Grounding DINO: Apple-Silicon GPU ('mps') when available, CPU
 # otherwise. If MPS ever throws an unsupported-operation error, hardcode 'cpu'.
@@ -179,6 +186,32 @@ def detect_product(frame, processor, model, prompt):
     return box, str(labels[best]), float(results['scores'][best])
 
 
+def detect_products_all(frame, processor, model, prompt):
+    """Like detect_product, but returns EVERY detection at/above threshold as a
+    list of (box, label, score) — used by MULTI_INSTANCE to segment a cluster
+    (e.g. a penguin family) as one object. Sorted by score, highest first."""
+    rgb    = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+    inputs = processor(
+        images=Image.fromarray(rgb),
+        text=normalise_prompt(prompt),
+        return_tensors='pt',
+    ).to(DEVICE)
+    with torch.no_grad():
+        outputs = model(**inputs)
+    h, w = frame.shape[:2]
+    results = processor.post_process_grounded_object_detection(
+        outputs, inputs.input_ids,
+        threshold=BOX_THRESHOLD, text_threshold=TEXT_THRESHOLD,
+        target_sizes=[(h, w)],
+    )[0]
+    labels = results.get('text_labels', results.get('labels'))
+    dets = [(results['boxes'][i].cpu().numpy().astype(int).tolist(),
+             str(labels[i]), float(results['scores'][i]))
+            for i in range(len(results['scores']))]
+    dets.sort(key=lambda d: d[2], reverse=True)
+    return dets
+
+
 # -------------------------------------- SAM 2 segmentation --------------------------------------
 
 def segment_with_sam2(frame, box, sam_model):
@@ -203,6 +236,24 @@ def segment_with_sam2(frame, box, sam_model):
     if raw_mask.shape != (h, w):
         raw_mask = cv2.resize(raw_mask, (w, h), interpolation=cv2.INTER_NEAREST)
     return (raw_mask > 0.5).astype(np.uint8) * 255
+
+
+def segment_union_sam2(frame, boxes, sam_model):
+    """Segment several boxes at once and OR their masks into one — the group
+    silhouette for a cluster subject (MULTI_INSTANCE). SAM 2 accepts all boxes
+    in a single call. Returns a 0/255 mask, or None if nothing segmented."""
+    if not boxes:
+        return None
+    results = sam_model(frame, bboxes=boxes, verbose=False)
+    if not results or results[0].masks is None or len(results[0].masks.data) == 0:
+        return None
+    h, w = frame.shape[:2]
+    union = np.zeros((h, w), np.uint8)
+    for m in results[0].masks.data.cpu().numpy():
+        if m.shape != (h, w):
+            m = cv2.resize(m, (w, h), interpolation=cv2.INTER_NEAREST)
+        union |= (m > 0.5).astype(np.uint8)
+    return union * 255
 
 
 # -------------------------------------- A4 sheet detection (OpenCV contours) --------------------------------------
@@ -366,20 +417,41 @@ def process_frame(frame_path, dino_processor, dino_model, sam_model, camera_matr
     frame, camera_matrix = undistort_frame(frame, camera_matrix, dist_coeffs)
 
     # 2 — Grounding DINO product detection (box only)
-    product_box, product_class, product_conf = detect_product(frame, dino_processor, dino_model, PRODUCT_PROMPT)
     product_mask = None
     mask_source  = 'grounding-dino-base + sam2.1_b'
-    if product_box is None:
-        print(f"  [!] No product matched '{PRODUCT_PROMPT}' in {os.path.basename(frame_path)}")
-    else:
-        print(f"  [✓] Product detected  — matched '{product_class}', confidence {product_conf:.2f}, box {product_box}")
-
-        # 3 — SAM 2 turns the box into a pixel-precise mask
-        product_mask = segment_with_sam2(frame, product_box, sam_model)
-        if product_mask is None:
-            print(f"  [!] SAM 2 returned no mask — frame will be skipped downstream")
+    if MULTI_INSTANCE:
+        # Cluster subject: keep every detection and union their masks into one.
+        dets = detect_products_all(frame, dino_processor, dino_model, PRODUCT_PROMPT)
+        if not dets:
+            product_box = product_class = None
+            product_conf = 0.0
+            print(f"  [!] No product matched '{PRODUCT_PROMPT}' in {os.path.basename(frame_path)}")
         else:
-            print(f"  [✓] Mask extracted with SAM 2")
+            boxes = [d[0] for d in dets]
+            product_class, product_conf = dets[0][1], dets[0][2]
+            # report bbox = union of all instance boxes (for debug/provenance)
+            product_box = [min(b[0] for b in boxes), min(b[1] for b in boxes),
+                           max(b[2] for b in boxes), max(b[3] for b in boxes)]
+            print(f"  [✓] {len(boxes)} instances matched '{product_class}' "
+                  f"(top conf {product_conf:.2f}) — unioning masks")
+            product_mask = segment_union_sam2(frame, boxes, sam_model)
+            if product_mask is None:
+                print(f"  [!] SAM 2 returned no mask — frame will be skipped downstream")
+            else:
+                print(f"  [✓] Group mask extracted with SAM 2 ({len(boxes)} instances)")
+    else:
+        product_box, product_class, product_conf = detect_product(frame, dino_processor, dino_model, PRODUCT_PROMPT)
+        if product_box is None:
+            print(f"  [!] No product matched '{PRODUCT_PROMPT}' in {os.path.basename(frame_path)}")
+        else:
+            print(f"  [✓] Product detected  — matched '{product_class}', confidence {product_conf:.2f}, box {product_box}")
+
+            # 3 — SAM 2 turns the box into a pixel-precise mask
+            product_mask = segment_with_sam2(frame, product_box, sam_model)
+            if product_mask is None:
+                print(f"  [!] SAM 2 returned no mask — frame will be skipped downstream")
+            else:
+                print(f"  [✓] Mask extracted with SAM 2")
 
     # 3 — OpenCV A4 sheet detection
     a4_corners, a4_box = detect_a4_sheet(frame)
