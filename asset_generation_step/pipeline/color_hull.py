@@ -130,7 +130,11 @@ def sample_view(view, X, Y, Z, cam, dist, calib_wh, extents=None):
     samples, unrotated = [], 0
     for mp in mask_paths:
         stem = os.path.basename(mp).replace('_product_mask.png', '')
-        hits = glob.glob(os.path.join(FRAMES_DIR, stem + '.*'))
+        # recursive so FRAMES_DIR can be a per-view capture ROOT (front/, side/,
+        # ...) OR a flat folder — either way each mask's frame is found by stem.
+        hits = (glob.glob(os.path.join(FRAMES_DIR, stem + '.*'))
+                or glob.glob(os.path.join(FRAMES_DIR, '**', stem + '.*'),
+                             recursive=True))
         if not hits:
             print(f"    [!] no frame for {stem} — skipped")
             continue

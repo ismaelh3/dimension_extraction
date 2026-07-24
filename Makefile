@@ -1,5 +1,5 @@
 
-.PHONY: help setup camera-calibration instance-segmentation depth-estimation measurement-extraction merge-views accuracy-validation diagnostic-overlay build build-asset color-asset texture-asset material-asset setup-triposr generate-interior assemble-asset render-asset render-glass test-asset full-pipeline clean-images clean-frames clean-some-outputs clean-outputs clean-all
+.PHONY: help setup camera-calibration instance-segmentation depth-estimation measurement-extraction merge-views accuracy-validation diagnostic-overlay measure-all build build-asset color-asset texture-asset material-asset setup-triposr generate-interior assemble-asset render-asset render-glass test-asset full-pipeline clean-images clean-frames clean-some-outputs clean-outputs clean-all
 
 VENV = venv
 PYTHON = $(VENV)/bin/python
@@ -45,6 +45,11 @@ measurement-extraction:
 merge-views:
 	@echo "merging per-view measurements..."
 	@$(PYTHON) measurement_extraction_step/merge_views.py
+
+measure-all:
+	@echo "measuring ALL views from a single upload (per-view subfolders under FRAMES_ROOT)..."
+	@echo "use case: SUBJECT=x FRAMES_ROOT=path/to/<subject> make measure-all   (expects <subject>/front/ <subject>/side/ ...)"
+	@$(PYTHON) measurement_extraction_step/measure_all.py
 
 diagnostic-overlay:
 	@echo "rendering measurement diagnostic overlays..."

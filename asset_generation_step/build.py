@@ -28,8 +28,10 @@ Non-interactive wizard (automation/tests): set ANS_* env vars (see run_wizard).
 Force a full rebuild ignoring existing outputs with FORCE=1.
 """
 
+import glob
 import json
 import os
+import shutil
 import subprocess
 import sys
 
@@ -38,14 +40,18 @@ import yaml
 BASE = os.path.dirname(os.path.abspath(__file__))          # asset_generation_step/
 REPO = os.path.dirname(BASE)
 PY = sys.executable
+sys.path.insert(0, os.path.join(BASE, "pipeline"))
+import glassiness  # noqa: E402
 SUBJECTS_DIR = os.path.join(BASE, "subjects")
 WORK = os.path.join(BASE, "work")
 MASKS = os.path.join(BASE, "masks")
 DEFAULT_FRAMES = os.path.join(REPO, "instance_segmentation_step", "frames")
 
 SEG      = os.path.join(REPO, "instance_segmentation_step", "segmentation.py")
-MEASURE  = os.path.join(REPO, "measurement_extraction_step", "measurement_extraction.py")
-MERGE    = os.path.join(REPO, "measurement_extraction_step", "merge_views.py")
+SEG_OUT  = os.path.join(REPO, "instance_segmentation_step", "output")
+DEPTH    = os.path.join(REPO, "depth_estimation_step", "depth_estimation.py")
+DEPTH_JSON = os.path.join(REPO, "depth_estimation_step", "output", "depth_results.json")
+MEASURE_ALL = os.path.join(REPO, "measurement_extraction_step", "measure_all.py")
 CARVE    = os.path.join(BASE, "pipeline", "build_silhouette_mesh.py")
 GENERATE = os.path.join(BASE, "pipeline", "generate_interior.py")
 TEXTURE  = os.path.join(BASE, "pipeline", "texture_hull.py")
@@ -86,21 +92,11 @@ def run_wizard(subject):
     print(f"[build] no manifest for '{subject}' — quick setup:")
     prompt = ask("What is it? (segmentation prompt, e.g. 'perfume bottle.')",
                  default="product.", env="ANS_PROMPT")
-    transparent = ask("Is it transparent / reflective (glass)?", ["y", "n"],
-                      default="n", env="ANS_TRANSPARENT") == "y"
-    interior_mode = "none"
-    if transparent:
-        inside = ask("Is there a SEPARATE object inside it?", ["y", "n"],
-                     default="n", env="ANS_INSIDE") == "y"
-        if inside:
-            klass = "transparent_container"
-            interior_mode = ask("Reconstruct the interior how?",
-                                 ["generative", "carved"], default="generative",
-                                 env="ANS_INTERIOR_MODE")
-        else:
-            klass = "transparent_hollow"
-    else:
-        klass = "opaque_solid"
+    # NOTE: "is it transparent/reflective?" is NOT asked — it's auto-detected
+    # from the captures (glassiness.py: depth see-through + specular) and written
+    # back as the class. Set ANS_CLASS to force it; edit the manifest to
+    # transparent_container for the rare shell-with-a-separate-interior case.
+    klass = os.environ.get("ANS_CLASS", "auto")
     geometry = ask("Geometry: silhouette carve, or generative (clusters/thin/"
                    "hard-to-carve)?", ["carve", "generative"], default="carve",
                    env="ANS_GEOMETRY")
@@ -110,13 +106,12 @@ def run_wizard(subject):
     manifest = {
         "subject": subject,
         "prompt": prompt,
-        "class": klass,
+        "class": klass,                    # 'auto' -> resolved by glassiness
         "geometry": geometry,
         "multi_instance": multi,
-        "interior": {"mode": interior_mode},
+        "interior": {"mode": "none"},
         "frames_dir": os.environ.get("FRAMES_DIR", DEFAULT_FRAMES),
-        "render_scene": os.environ.get("ANS_SCENE",
-                                       PROFILES[klass]["render_scene"]),
+        "render_scene": os.environ.get("ANS_SCENE", "none"),
         "overrides": {},
     }
     os.makedirs(SUBJECTS_DIR, exist_ok=True)
@@ -180,7 +175,52 @@ def have(subject, suffix):
     return os.path.exists(os.path.join(WORK, subject + suffix))
 
 
+def _front_src(frames):
+    s = os.path.join(frames, "front")
+    return s if os.path.isdir(s) else frames
+
+
+def resolve_class(manifest):
+    """Auto-detect the class when it is 'auto' (glassiness: depth see-through +
+    specular). Ensures a front-view glass map exists (segment + depth the front
+    frames if missing), scores it, and writes the resolved class back to the
+    manifest. transparent_container stays a manual manifest choice."""
+    if manifest.get("class", "auto") != "auto":
+        return manifest["class"]
+    subj = manifest["subject"]
+    frames = manifest.get("frames_dir", DEFAULT_FRAMES)
+    ov = {k: str(v) for k, v in (manifest.get("overrides") or {}).items()}
+    front = os.path.join(MASKS, subj, "front")
+    if not glob.glob(os.path.join(front, "*_glass.png")):
+        src = _front_src(frames)
+        step(SEG, {"SUBJECT": subj, "PRODUCT_PROMPT": manifest["prompt"],
+                   "MULTI_INSTANCE": "1" if manifest["multi_instance"] else "0",
+                   "FRAMES_DIR": src, "OUTPUT_DIR": SEG_OUT, **ov},
+             "auto-detect: segment front")
+        os.makedirs(front, exist_ok=True)
+        for f in glob.glob(os.path.join(src, "*.*")):
+            stem = os.path.splitext(os.path.basename(f))[0]
+            m = os.path.join(SEG_OUT, f"{stem}_product_mask.png")
+            if os.path.exists(m):
+                shutil.copy(m, os.path.join(front, f"{stem}_product_mask.png"))
+        depth_json = DEPTH_JSON
+        try:                                    # depth = the strong see-through cue
+            step(DEPTH, {**ov}, "auto-detect: depth front")
+        except SystemExit:
+            depth_json = None                   # no A4 -> specular-only fallback
+        glassiness.file_view_glass_maps(src, front, depth_json)
+    score, kind = glassiness.object_score(subj, MASKS)
+    resolved = "transparent_hollow" if kind == "transparent" else "opaque_solid"
+    print(f"[build] AUTO-DETECT: glassiness {score:.2f} → {kind} → "
+          f"class={resolved}")
+    manifest["class"] = resolved
+    with open(os.path.join(SUBJECTS_DIR, f"{subj}.yaml"), "w") as fh:
+        yaml.safe_dump(manifest, fh, sort_keys=False)
+    return resolved
+
+
 def build(manifest):
+    manifest["class"] = resolve_class(manifest)
     subj = manifest["subject"]
     klass = manifest["class"]
     if klass not in PROFILES:
@@ -195,27 +235,35 @@ def build(manifest):
           f"multi={manifest['multi_instance']} glass={prof['glass']} "
           f"assemble={prof['assemble']}")
 
-    # 1. SEGMENT -> masks/<subj>/front (one view; carve needs more, see note)
-    front = os.path.join(MASKS, subj, "front")
-    if force or not (os.path.isdir(front) and os.listdir(front)):
-        step(SEG, {"SUBJECT": subj, "PRODUCT_PROMPT": manifest["prompt"],
-                   "MULTI_INSTANCE": "1" if manifest["multi_instance"] else "0",
-                   "FRAMES_DIR": frames, "OUTPUT_DIR": front, **ov}, "segment")
-    else:
-        print("[build] segment: masks present, skipping")
-
-    # 2. GEOMETRY
+    multi = "1" if manifest["multi_instance"] else "0"
+    # 1 + 2. SEGMENT + GEOMETRY (path depends on the geometry source)
     if manifest["geometry"] == "generative":
+        # a single front view is enough for the learned prior. Source = the
+        # front/ subfolder if the capture uses per-view folders, else flat.
+        src = os.path.join(frames, "front")
+        if not os.path.isdir(src):
+            src = frames
+        front = os.path.join(MASKS, subj, "front")
+        if force or not (os.path.isdir(front) and os.listdir(front)):
+            step(SEG, {"SUBJECT": subj, "PRODUCT_PROMPT": manifest["prompt"],
+                       "MULTI_INSTANCE": multi, "FRAMES_DIR": src,
+                       "OUTPUT_DIR": front, **ov}, "segment (front view)")
+        else:
+            print("[build] segment: masks present, skipping")
         if force or not have(subj, "_hull.glb"):
             step(GENERATE, {"SUBJECT": subj, "INTERIOR_VIEW": "front",
                             "FRAMES_DIR": frames, **ov},
                  "geometry — generative (TripoSR)")
-    else:  # carve (needs view-organized masks + measurements; see README note)
+    else:  # carve — ALL views from a SINGLE upload (per-view subfolders)
         mj = os.path.join(REPO, "measurement_extraction_step", "output",
                           f"measurements_{subj}.json")
         if force or not os.path.exists(mj):
-            step(MEASURE, {"SUBJECT": subj, "FRAMES_DIR": frames, **ov}, "measure")
-            step(MERGE, {"SUBJECT": subj, **ov}, "merge-views")
+            step(MEASURE_ALL, {"SUBJECT": subj, "FRAMES_ROOT": frames,
+                               "PRODUCT_PROMPT": manifest["prompt"],
+                               "MULTI_INSTANCE": multi, **ov},
+                 "segment+depth+measure ALL views (single upload) + merge")
+        else:
+            print("[build] measure: measurements present, skipping")
         if force or not have(subj, "_hull.glb"):
             step(CARVE, {"SUBJECT": subj, "CROSS_SECTION": "silhouette",
                          **budgets, **ov}, "geometry — carve")

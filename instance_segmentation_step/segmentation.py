@@ -396,7 +396,7 @@ def draw_detections(frame, product_mask, product_box, product_class, a4_corners,
 
 # -------------------------------------- Process a single frame --------------------------------------
 
-def process_frame(frame_path, dino_processor, dino_model, sam_model, camera_matrix, dist_coeffs, calib_size_wh, output_dir):
+def process_frame(frame_path, dino_processor, dino_model, sam_model, camera_matrix, dist_coeffs, calib_size_wh, output_dir, rel_dir=''):
     """
     Full Step 3 pipeline for one frame:
       1. Load and undistort the image.
@@ -405,6 +405,12 @@ def process_frame(frame_path, dino_processor, dino_model, sam_model, camera_matr
       4. Detect the A4 sheet with OpenCV.
       5. Save a labelled debug image.
       6. Return a result dict for this frame.
+
+    output_dir is the (already-created) directory this frame's debug image and mask
+    are written to — it mirrors the frame's sub-folder under FRAMES_DIR. rel_dir is
+    that sub-folder path relative to FRAMES_DIR (e.g. 'perfume-bottle/front', or ''
+    for a frame sitting directly in FRAMES_DIR); it is recorded on the result so
+    later steps and merge logic know which view the frame came from.
     """
     frame = cv2.imread(frame_path)
     if frame is None:
@@ -480,6 +486,11 @@ def process_frame(frame_path, dino_processor, dino_model, sam_model, camera_matr
         'frame':        os.path.abspath(frame_path),
         'debug_image':  os.path.abspath(debug_path),
         'mask_source':  mask_source,
+        # Which capture folder this frame came from, mirrored from FRAMES_DIR.
+        # 'relpath' is the full sub-path ('perfume-bottle/front'); 'view' is just
+        # its last component ('front') — None for frames placed directly in FRAMES_DIR.
+        'relpath':      rel_dir or None,
+        'view':         os.path.basename(rel_dir) if rel_dir else None,
         'product': {
             'detected':     product_mask is not None,
             'class':        product_class,
@@ -498,10 +509,39 @@ def process_frame(frame_path, dino_processor, dino_model, sam_model, camera_matr
     }
 
 
+# -------------------------------------- Frame discovery --------------------------------------
+
+def discover_frames(frames_dir):
+    """
+    Walk frames_dir recursively and return a list of (abs_path, rel_dir) for every
+    JPEG/PNG found, so multiple views can be dropped in as separate sub-folders and
+    processed in one run:
+
+        frames/front/IMG.jpg   frames/side/IMG.jpg   frames/perfume-bottle/top/IMG.jpg
+
+    rel_dir is the image's parent folder RELATIVE to frames_dir ('' for images
+    sitting directly in frames_dir). It is used to mirror the input layout into the
+    output — frames/front/IMG.jpg -> output/front/IMG_detections.jpg — so per-view
+    outputs never collide, and to tag each result with the view it came from.
+
+    A flat frames_dir (images directly inside, no sub-folders) yields rel_dir=''
+    for all of them, reproducing the original single-folder behaviour exactly.
+    """
+    frames = []
+    for dirpath, dirnames, filenames in os.walk(frames_dir):
+        dirnames.sort()  # deterministic recursion order
+        rel_dir = os.path.relpath(dirpath, frames_dir)
+        rel_dir = '' if rel_dir == '.' else rel_dir
+        for f in sorted(filenames):
+            if f.lower().endswith(('.jpg', '.jpeg', '.png')):
+                frames.append((os.path.join(dirpath, f), rel_dir))
+    return frames
+
+
 # -------------------------------------- Main --------------------------------------
 
 def main():
-    
+
     print("\n======== Step 3 — Instance Segmentation (Product) =========\n")
 
     if not os.path.isdir(FRAMES_DIR):
@@ -509,18 +549,17 @@ def main():
         print("    Create a 'frames/' folder and place your captured product images inside it.")
         return
 
-    # Collect all JPEG/PNG frames, sorted for consistent ordering
-    frame_paths = sorted([
-        os.path.join(FRAMES_DIR, f)
-        for f in os.listdir(FRAMES_DIR)
-        if f.lower().endswith(('.jpg', '.jpeg', '.png'))
-    ])
+    # Collect all JPEG/PNG frames, recursing into per-view sub-folders. Each entry
+    # is (abs_path, rel_dir) so the output can mirror the input's folder layout.
+    frames = discover_frames(FRAMES_DIR)
 
-    if not frame_paths:
+    if not frames:
         print(f"[!] No images found in '{FRAMES_DIR}'. Add your captured frames and re-run.")
         return
 
-    print(f"Found {len(frame_paths)} frame(s) to process.")
+    views = sorted({rel for _, rel in frames if rel})
+    print(f"Found {len(frames)} frame(s) to process"
+          + (f" across {len(views)} view folder(s): {views}." if views else " (flat folder)."))
     print(f"Product prompt: '{PRODUCT_PROMPT}'")
     print()
 
@@ -544,19 +583,37 @@ def main():
 
     os.makedirs(OUTPUT_DIR, exist_ok=True)
 
-    # Process every frame and collect results
-    all_results = []
-    for i, fp in enumerate(frame_paths):
-        print(f"Frame {i+1}/{len(frame_paths)}: {os.path.basename(fp)}")
-        result = process_frame(fp, dino_processor, dino_model, sam_model, camera_matrix, dist_coeffs, calib_size_wh, OUTPUT_DIR)
+    # Process every frame and collect results. Each frame's outputs (debug image +
+    # mask) are written into a sub-folder of OUTPUT_DIR that mirrors its sub-folder
+    # under FRAMES_DIR, so per-view outputs never overwrite each other.
+    all_results       = []
+    results_by_view   = {}   # rel_dir -> [result, ...]
+    for i, (fp, rel_dir) in enumerate(frames):
+        out_sub = os.path.join(OUTPUT_DIR, rel_dir)
+        os.makedirs(out_sub, exist_ok=True)
+        tag = f"[{rel_dir}] " if rel_dir else ""
+        print(f"Frame {i+1}/{len(frames)}: {tag}{os.path.basename(fp)}")
+        result = process_frame(fp, dino_processor, dino_model, sam_model, camera_matrix, dist_coeffs, calib_size_wh, out_sub, rel_dir)
         if result:
             all_results.append(result)
+            results_by_view.setdefault(rel_dir, []).append(result)
         print()
 
-    # Write all frame results to a single JSON file — consumed by Steps 5 and 6
+    # Write a combined JSON at the output root — this is the file Steps 5 and 6 read
+    # from a hard-coded path, so it always exists regardless of the folder layout.
     results_path = os.path.join(OUTPUT_DIR, 'segmentation_results.json')
     with open(results_path, 'w') as f:
         json.dump(all_results, f, indent=2)
+
+    # Also mirror a per-view segmentation_results.json into each view sub-folder, so
+    # the output layout matches the input layout and a single view can be consumed on
+    # its own. (Skipped for a flat run, where that file would just duplicate the
+    # combined one written above.)
+    for rel_dir, res in results_by_view.items():
+        if not rel_dir:
+            continue
+        with open(os.path.join(OUTPUT_DIR, rel_dir, 'segmentation_results.json'), 'w') as f:
+            json.dump(res, f, indent=2)
 
     # Summary
     product_ok = sum(1 for r in all_results if r['product']['detected'])
@@ -565,6 +622,10 @@ def main():
 
     print("─" * 45)
     print(f"Results saved to : {results_path}")
+    if len(results_by_view) > 1 or (results_by_view and '' not in results_by_view):
+        print("Per-view results : " + ", ".join(
+            f"{rel or '(root)'} ({sum(1 for r in res if r['product']['detected'])}/{len(res)} product)"
+            for rel, res in sorted(results_by_view.items())))
     print(f"Product detected : {product_ok}/{total} frames")
     print(f"A4 detected      : {a4_ok}/{total} frames")
 

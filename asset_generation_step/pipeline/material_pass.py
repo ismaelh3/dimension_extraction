@@ -38,18 +38,22 @@ from pygltflib import GLTF2
 
 BASE_DIR   = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))  # asset_generation_step/
 sys.path.insert(0, os.path.join(BASE_DIR, 'tools'))
+sys.path.insert(0, os.path.join(BASE_DIR, 'pipeline'))
 from preview_render import raster_preview  # noqa: E402
+import glassiness  # noqa: E402
 
 SUBJECT_ID = os.environ.get('SUBJECT', 'product_000')
 IN_GLB     = os.path.join(BASE_DIR, 'work', f'{SUBJECT_ID}_textured.glb')
 OUT_GLB    = os.path.join(BASE_DIR, 'work', f'{SUBJECT_ID}_final.glb')
 DEBUG_PNG  = os.path.join(BASE_DIR, 'work', f'{SUBJECT_ID}_split_debug.png')
+MASKS_ROOT = os.path.join(BASE_DIR, 'masks')
 
 GLASS_ROUGHNESS    = float(os.environ.get('GLASS_ROUGHNESS', '0.08'))
 BASE_ROUGHNESS     = float(os.environ.get('BASE_ROUGHNESS', '0.9'))
 GLASS_ALPHA        = float(os.environ.get('GLASS_ALPHA', '1.0'))
 GLASS_TRANSMISSION = float(os.environ.get('GLASS_TRANSMISSION', '0'))
-NECK_Y             = os.environ.get('NECK_Y')  # optional manual override
+NECK_Y             = os.environ.get('NECK_Y')            # manual neck override
+GLASS_THRESHOLD    = float(os.environ.get('GLASS_THRESHOLD', '0.35'))  # face glassiness cutoff
 
 
 def find_neck(mesh, bins=160):
@@ -96,19 +100,32 @@ def main():
     texture = mesh.visual.material.baseColorTexture
     print(f"Subject: {SUBJECT_ID}   {len(mesh.faces):,} faces\n")
 
-    y0, y1 = mesh.bounds[:, 1]
-    if NECK_Y is not None:
-        neck = y0 + float(NECK_Y) * (y1 - y0)
-        print(f"[*] Neck height overridden: {float(NECK_Y):.2f} of height")
-    else:
-        neck = find_neck(mesh)
-        print(f"[*] Neck auto-detected at {(neck - y0) / (y1 - y0):.2f} "
-              f"of height ({neck * 100:.2f} cm)")
+    # WHICH faces are glass. Prefer IMAGE-DERIVED glassiness (depth see-through +
+    # specular, projected onto the mesh) when glass maps exist — general for any
+    # shape. Fall back to the geometric NECK pinch (a dome-on-pedestal
+    # assumption) only when there are no glass maps (e.g. the snowglobe path or
+    # NECK_Y is set explicitly).
+    face_glass = None
+    if NECK_Y is None:
+        face_glass = glassiness.bake_face_glassiness(mesh, SUBJECT_ID, MASKS_ROOT)
 
-    centroid_y = mesh.vertices[mesh.faces][:, :, 1].mean(axis=1)
-    glass_mask = centroid_y > neck
-    print(f"    glass: {glass_mask.sum():,} faces   "
-          f"base: {(~glass_mask).sum():,} faces")
+    if face_glass is not None:
+        glass_mask = face_glass > GLASS_THRESHOLD
+        print(f"[*] glass from image glassiness (> {GLASS_THRESHOLD}): "
+              f"{glass_mask.sum():,} glass / {(~glass_mask).sum():,} opaque faces")
+    else:
+        y0, y1 = mesh.bounds[:, 1]
+        if NECK_Y is not None:
+            neck = y0 + float(NECK_Y) * (y1 - y0)
+            print(f"[*] Neck height overridden: {float(NECK_Y):.2f} of height")
+        else:
+            neck = find_neck(mesh)
+            print(f"[*] No glass maps — neck fallback at "
+                  f"{(neck - y0) / (y1 - y0):.2f} of height ({neck * 100:.2f} cm)")
+        centroid_y = mesh.vertices[mesh.faces][:, :, 1].mean(axis=1)
+        glass_mask = centroid_y > neck
+        print(f"    glass: {glass_mask.sum():,} faces   "
+              f"base: {(~glass_mask).sum():,} faces")
 
     glass_mat = trimesh.visual.material.PBRMaterial(
         name='glass_dome', baseColorTexture=texture,
@@ -121,10 +138,14 @@ def main():
         metallicFactor=0.0, roughnessFactor=BASE_ROUGHNESS)
 
     scene = trimesh.Scene()
-    scene.add_geometry(submesh_with_uv(mesh, uv, glass_mask, glass_mat),
-                       geom_name='glass_dome')
-    scene.add_geometry(submesh_with_uv(mesh, uv, ~glass_mask, base_mat),
-                       geom_name='rock_base')
+    # keep 'glass' in the name so render_asset / assemble_container detect it;
+    # skip a region if it's empty (a fully-glass or fully-opaque object).
+    if glass_mask.any():
+        scene.add_geometry(submesh_with_uv(mesh, uv, glass_mask, glass_mat),
+                           geom_name='glass_dome')
+    if (~glass_mask).any():
+        scene.add_geometry(submesh_with_uv(mesh, uv, ~glass_mask, base_mat),
+                           geom_name='rock_base')
     scene.export(OUT_GLB)
 
     g = GLTF2().load(OUT_GLB)
@@ -138,20 +159,28 @@ def main():
             g.extensionsUsed = (g.extensionsUsed or []) + \
                 ['KHR_materials_transmission']
         print(f"    KHR_materials_transmission = {GLASS_TRANSMISSION:g}")
-    src_extras['material_pass'] = {
-        'neck_fraction_of_height': round((neck - y0) / (y1 - y0), 4),
+    meta = {
+        'method': 'image_glassiness' if face_glass is not None else 'neck',
         'glass_roughness': GLASS_ROUGHNESS, 'base_roughness': BASE_ROUGHNESS,
         'glass_alpha': GLASS_ALPHA, 'glass_transmission': GLASS_TRANSMISSION,
+        'glass_faces': int(glass_mask.sum()),
     }
+    if face_glass is not None:
+        meta['glass_threshold'] = GLASS_THRESHOLD
+    else:
+        meta['neck_fraction_of_height'] = round((neck - y0) / (y1 - y0), 4)
+    src_extras['material_pass'] = meta
     g.scenes[g.scene or 0].extras = src_extras
     g.save(OUT_GLB)
 
-    # debug render: region split tinted (blue = glass, warm = base) so a bad
-    # neck pick is obvious at a glance
+    # debug render: region split tinted (blue = glass, warm = opaque) so a bad
+    # split is obvious at a glance. Colour vertices by glass-face membership.
     dbg = np.zeros((len(mesh.vertices), 4), np.uint8)
-    vy = mesh.vertices[:, 1]
     dbg[:] = [210, 150, 90, 255]
-    dbg[vy > neck] = [110, 160, 235, 255]
+    vglass = np.zeros(len(mesh.vertices), bool)
+    if glass_mask.any():
+        vglass[mesh.faces[glass_mask].reshape(-1)] = True
+    dbg[vglass] = [110, 160, 235, 255]
     raster_preview(mesh, vertex_colors=dbg).save(DEBUG_PNG)
 
     size_mb = os.path.getsize(OUT_GLB) / 1024 / 1024

@@ -1,0 +1,7 @@
+subject: bottle-mv
+prompt: perfume bottle.
+class: transparent_hollow
+geometry: carve
+multi_instance: false
+frames_dir: instance_segmentation_step/frames/perfume-bottle
+overrides: {}

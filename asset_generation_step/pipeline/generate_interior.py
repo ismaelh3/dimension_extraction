@@ -76,7 +76,10 @@ def pick_frame():
     else:
         mask = masks[len(masks) // 2]           # middle frame of the view
     stem = os.path.basename(mask).replace("_product_mask.png", "")
-    frames = glob.glob(os.path.join(FRAMES_DIR, stem + ".*"))
+    # recursive so FRAMES_DIR may be a per-view capture root or a flat folder
+    frames = (glob.glob(os.path.join(FRAMES_DIR, stem + ".*"))
+              or glob.glob(os.path.join(FRAMES_DIR, "**", stem + ".*"),
+                           recursive=True))
     if not frames:
         sys.exit(f"[generate_interior] no frame for {stem} in {FRAMES_DIR}")
     return frames[0], mask, stem
